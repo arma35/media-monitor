@@ -1,0 +1,11 @@
+# Local settings (copy from settings.example.txt). Never overwrite on update.
+#
+# article_date_not_later_than — YYYY-MM-DD
+#   Keep hits where article publish date is on or before this day.
+#   If publish date is not found on the page — still include the hit.
+#   Empty value = no date filter.
+#
+# auth_timeout_seconds — how long to wait for login/password at start (default 180).
+
+article_date_not_later_than=
+auth_timeout_seconds=180

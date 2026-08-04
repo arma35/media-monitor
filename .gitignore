@@ -9,6 +9,7 @@ build/
 # Local configs — never overwrite / never commit user lists
 sites.txt
 words.txt
+settings.txt
 
 # Runtime log (appendable)
 media-monitor.txt

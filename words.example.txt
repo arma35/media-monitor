@@ -1,8 +1,11 @@
-# One keyword or phrase per line.
-# Search is case-insensitive. Lines starting with # are ignored.
+# One search query per line.
+# The whole line is an exact phrase (case-insensitive), including spaces.
+# Example: audi выпустили новую А6
+# Lines starting with # are ignored.
 #
 # Copy this file to words.txt and edit your list:
 #   copy words.example.txt words.txt
 
 пример
 новости
+audi выпустили новую А6
