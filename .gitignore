@@ -10,6 +10,9 @@ build/
 sites.txt
 words.txt
 
+# Runtime log (appendable)
+media-monitor.txt
+
 # Generated reports
 reports/*
 !reports/.gitkeep
