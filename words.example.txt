@@ -1,0 +1,8 @@
+# One keyword or phrase per line.
+# Search is case-insensitive. Lines starting with # are ignored.
+#
+# Copy this file to words.txt and edit your list:
+#   copy words.example.txt words.txt
+
+пример
+новости

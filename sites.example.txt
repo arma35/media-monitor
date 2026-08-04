@@ -1,0 +1,9 @@
+# One URL per line (news sites, public pages, media home pages).
+# Lines starting with # are ignored.
+#
+# Copy this file to sites.txt and edit your list:
+#   copy sites.example.txt sites.txt
+
+https://example.com
+https://www.bbc.com/news
+https://ria.ru
