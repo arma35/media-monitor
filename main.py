@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.13"
+VERSION = "0.0.14"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -114,6 +114,45 @@ def ensure_local_config(root: Path, name: str) -> Path:
         f"Missing {name} and {example.name}. "
         "Add the example file from the repo or create the config manually."
     )
+
+
+def _settings_key_count(path: Path) -> int:
+    count = 0
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() and value.strip() != "":
+            count += 1
+        elif key.strip():
+            # empty value still counts as a declared setting key
+            count += 1
+    return count
+
+
+def resolve_settings_path(root: Path) -> Path:
+    """
+    Working file is setting.txt.
+    If settings.txt exists and is newer / has more keys — sync it into setting.txt.
+    """
+    singular = root / "setting.txt"
+    plural = root / "settings.txt"
+
+    if plural.is_file() and singular.is_file():
+        plural_newer = plural.stat().st_mtime >= singular.stat().st_mtime
+        plural_richer = _settings_key_count(plural) > _settings_key_count(singular)
+        if plural_newer or plural_richer:
+            shutil.copy2(plural, singular)
+            print("Synced settings.txt -> setting.txt")
+        return singular
+    if plural.is_file() and not singular.is_file():
+        shutil.copy2(plural, singular)
+        print("Created setting.txt from settings.txt")
+        return singular
+    if singular.is_file():
+        return singular
+    return ensure_local_config(root, "setting.txt")
 
 
 def load_lines(path: Path) -> list[str]:
@@ -1056,19 +1095,7 @@ def run() -> int:
         sites_path = ensure_local_config(root, "sites.txt")
         words_path = ensure_local_config(root, "words.txt")
         exclude_path = ensure_local_config(root, "exclude.txt")
-
-        # Prefer user-provided `setting.txt` (singular), but if only `settings.txt` exists,
-        # copy it to `setting.txt` so their edits are preserved.
-        setting_singular = root / "setting.txt"
-        settings_plural = root / "settings.txt"
-        if setting_singular.is_file():
-            settings_path = setting_singular
-        elif settings_plural.is_file():
-            shutil.copy2(settings_plural, setting_singular)
-            print("Copied settings.txt -> setting.txt (preserve your values).")
-            settings_path = setting_singular
-        else:
-            settings_path = ensure_local_config(root, "setting.txt")
+        settings_path = resolve_settings_path(root)
         sites = load_lines(sites_path)
         phrases = load_lines(words_path)
         excluded = load_exclude_urls(exclude_path)

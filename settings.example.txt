@@ -1,26 +1,24 @@
-# Local settings (copy from settings.example.txt). Never overwrite on update.
+# Local settings (copy from settings.example.txt → setting.txt / settings.txt).
+# Never overwritten on update if the local file already exists.
 #
 # article_date_not_later_than — YYYY-MM-DD  ("дата ДО")
-#   Keep hits with publish date on or before this day.
-#   Empty value = today.
+#   Empty = today.
 #
 # article_date_not_older_than — YYYY-MM-DD  ("не старше")
-#   Keep hits with publish date on or after this day.
-#   Empty value = no lower bound.
+#   Empty = no lower bound.
 #
-# Example: from 2020-01-01 through today
-#   article_date_not_later_than=
-#   article_date_not_older_than=2020-01-01
+# If publish date is not found — hit is still kept in the report.
 #
-# If publish date is not found on the page — still include the hit.
-#
-# max_scan_urls — max pages to scan in one run. 0 = no limit.
-# max_expand_links — max links taken from one listing/search page.
-#
-# auth_timeout_seconds — how long to wait for login/password at start (default 180).
+# max_scan_urls — 0 = no limit
+# max_expand_links — max links from one listing/search page
+# auth_timeout_seconds — login/password wait at start
 
+#дата ДО, если не задано то сегодня
 article_date_not_later_than=
+
+#дата НЕ старше
 article_date_not_older_than=
+
 max_scan_urls=0
 max_expand_links=120
 auth_timeout_seconds=180
