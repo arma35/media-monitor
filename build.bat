@@ -50,6 +50,14 @@ if not exist "dist\settings.txt" (
   echo Kept existing dist\settings.txt
 )
 
+REM Create singular config alias (setting.txt) if missing
+if not exist "dist\setting.txt" (
+  copy /Y "settings.example.txt" "dist\setting.txt" >nul
+  echo Created dist\setting.txt from example
+) else (
+  echo Kept existing dist\setting.txt
+)
+
 echo.
 echo Done. Portable folder: dist\
 echo   media-monitor.exe

@@ -23,7 +23,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,7 +87,14 @@ def ensure_local_config(root: Path, name: str) -> Path:
     target = root / name
     if target.is_file():
         return target
-    example = root / name.replace(".txt", ".example.txt")
+
+    # Backward/forward compatibility:
+    # - historically user asked for `setting.txt` (singular)
+    # - example file is `settings.example.txt` (plural)
+    if name.lower() == "setting.txt":
+        example = root / "settings.example.txt"
+    else:
+        example = root / name.replace(".txt", ".example.txt")
     if example.is_file():
         shutil.copy2(example, target)
         print(f"Created {name} from {example.name} (edit it for your list).")
@@ -516,7 +523,19 @@ def run() -> int:
     try:
         sites_path = ensure_local_config(root, "sites.txt")
         words_path = ensure_local_config(root, "words.txt")
-        settings_path = ensure_local_config(root, "settings.txt")
+
+        # Prefer user-provided `setting.txt` (singular), but if only `settings.txt` exists,
+        # copy it to `setting.txt` so their edits are preserved.
+        setting_singular = root / "setting.txt"
+        settings_plural = root / "settings.txt"
+        if setting_singular.is_file():
+            settings_path = setting_singular
+        elif settings_plural.is_file():
+            shutil.copy2(settings_plural, setting_singular)
+            print("Copied settings.txt -> setting.txt (preserve your values).")
+            settings_path = setting_singular
+        else:
+            settings_path = ensure_local_config(root, "setting.txt")
         sites = load_lines(sites_path)
         phrases = load_lines(words_path)
         settings = load_settings(settings_path)
