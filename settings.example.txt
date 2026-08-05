@@ -12,7 +12,9 @@
 #   article_date_not_later_than=
 #   article_date_not_older_than=2020-01-01
 #
-# If publish date is not found on the page — still include the hit.
+# If publish date is not found:
+#   - when article_date_not_older_than is set → hit is EXCLUDED
+#   - otherwise → hit is kept
 #
 # max_scan_urls — max pages to scan in one run. 0 = no limit.
 # max_expand_links — max links taken from one listing/search page.

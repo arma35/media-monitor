@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
@@ -27,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.11"
+VERSION = "0.0.12"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -720,20 +721,54 @@ NON_ARTICLE_PATH_PREFIXES = (
     "/search",
     "/login",
     "/register",
+    "/news/hashtag/",
+    "/news/popular/",
+    "/news/articles/",
+    "/news/longread/",
+    "/news/main/",
+    "/russia/news/",
 )
+
+# Bare section roots (listings, not articles)
+NON_ARTICLE_EXACT_PATHS = {
+    "/news/",
+    "/society/",
+    "/economics/",
+    "/economy/",
+    "/finance/",
+    "/politics/",
+    "/sport/",
+    "/culture/",
+    "/testy/",
+}
 
 
 def is_probable_article_url(url: str) -> bool:
     path = urlparse(url).path.lower().rstrip("/") + "/"
     if path == "/":
         return False
+    if path in NON_ARTICLE_EXACT_PATHS:
+        return False
     for prefix in NON_ARTICLE_PATH_PREFIXES:
         if path.startswith(prefix) or prefix.rstrip("/") == path.rstrip("/"):
             return False
-    # pagination / query junk
     if re.search(r"/page/\d+/?", path):
         return False
     return True
+
+
+def article_link_priority(url: str) -> int:
+    """Lower = better candidate (prefer concrete news IDs over section hubs)."""
+    path = urlparse(url).path.lower()
+    if re.search(r"/news/\d+", path):
+        return 0
+    if re.search(r"/\d{8}(?:-\d+)?", path):
+        return 1
+    if re.search(r"/\d{4}/\d{2}/", path):
+        return 2
+    if re.search(r"/\d{6,}", path):
+        return 3
+    return 9
 
 
 def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[str]]:
@@ -762,6 +797,7 @@ def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[
         if clean not in seen:
             seen.add(clean)
             links.append(clean)
+    links.sort(key=article_link_priority)
     return title, published, text, links
 
 
@@ -784,10 +820,11 @@ def passes_date_filter(
 ) -> bool:
     """
     Keep if min_date <= published <= max_date.
-    Unknown publish date — keep (include in report).
+    If a min-date ("не старше") is set and publish date is unknown — exclude.
     """
     if published is None:
-        return True
+        # Without a date we cannot prove the article is new enough.
+        return min_date is None
     if min_date is not None and published < min_date:
         return False
     if max_date is not None and published > max_date:
@@ -842,6 +879,8 @@ def site_search_urls(origin: str, phrase: str) -> list[str]:
     q = quote(phrase)
     base = origin.rstrip("/")
     return [
+        # Yii/media sites (amurmedia.ru etc.)
+        f"{base}/search/?SearchModel%5Bkeyword%5D={q}",
         f"{base}/search/?q={q}",
         f"{base}/?s={q}",
         f"{base}/search?query={q}",
@@ -976,9 +1015,21 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
     return out_path
 
 
+def format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м {s}с"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+
 def run() -> int:
     root = app_dir()
     reports_dir = root / "reports"
+    started_mono = time.monotonic()
 
     print(f"media-monitor v{VERSION}")
     print(f"Working directory: {root}")
@@ -1004,6 +1055,8 @@ def run() -> int:
         settings = load_settings(settings_path)
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}")
+        elapsed = time.monotonic() - started_mono
+        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
         return 1
 
     print(f"Sites: {sites_path.name}")
@@ -1011,11 +1064,16 @@ def run() -> int:
     print(f"Settings: {settings_path.name}")
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
+    unknown_note = (
+        "unknown publish dates are EXCLUDED when 'not older than' is set"
+        if older
+        else "unknown publish dates are kept"
+    )
     print(
         "Filter dates: "
         f"not older than {older.isoformat() if older else '(off)'}, "
         f"not later than {later.isoformat()} "
-        "(unknown publish dates are kept)"
+        f"({unknown_note})"
     )
     scan_limit = settings.max_scan_urls
     print(
@@ -1026,9 +1084,13 @@ def run() -> int:
 
     if not sites:
         print("ERROR: sites.txt is empty (no URLs).")
+        elapsed = time.monotonic() - started_mono
+        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
         return 1
     if not phrases:
         print("ERROR: words.txt is empty (no keywords/phrases).")
+        elapsed = time.monotonic() - started_mono
+        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
         return 1
 
     print(f"Loaded {len(sites)} site(s), {len(phrases)} phrase(s).")
@@ -1060,12 +1122,14 @@ def run() -> int:
             print(f"  [error] {exc}")
 
     report_path = write_report(hits, reports_dir, datetime.now())
+    elapsed = time.monotonic() - started_mono
     print()
     print(
         f"Done. Hits: {len(hits)}. Errors: {errors}. "
         f"Skipped (auth): {skipped_auth}."
     )
     print(f"Report: {report_path}")
+    print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
     return 0
 
 
