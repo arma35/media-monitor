@@ -1,0 +1,89 @@
+name: Build Windows Dist
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - cursor/**
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build exe with PyInstaller
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          Write-Host "Building media-monitor v$version"
+          pyinstaller --noconfirm --clean --onefile --name media-monitor `
+            --distpath dist `
+            --workpath build `
+            main.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare dist folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\reports | Out-Null
+          Copy-Item -Force sites.example.txt, words.example.txt, settings.example.txt, exclude.example.txt dist\
+          if (Test-Path ИНСТРУКЦИЯ.txt) { Copy-Item -Force ИНСТРУКЦИЯ.txt dist\ }
+          if (Test-Path ИНСТРУКЦИЯ.docx) { Copy-Item -Force ИНСТРУКЦИЯ.docx dist\ }
+          if (Test-Path VERSION) { Copy-Item -Force VERSION dist\ }
+
+          foreach ($name in @("sites", "words", "settings", "exclude")) {
+            $target = "dist\$name.txt"
+            if (-not (Test-Path $target)) {
+              Copy-Item -Force "$name.example.txt" $target
+              Write-Host "Created $target"
+            }
+          }
+
+          if (Test-Path dist\setting.txt) {
+            Remove-Item -Force dist\setting.txt
+          }
+
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Zip dist
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $zipName = "media-monitor-v$version-windows.zip"
+          if (Test-Path $zipName) { Remove-Item -Force $zipName }
+          Compress-Archive -Path dist\* -DestinationPath $zipName
+          Write-Host "Created $zipName"
+          Get-Item $zipName | Format-List Name, Length, FullName
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-monitor-windows
+          path: media-monitor-v*-windows.zip
+          if-no-files-found: error
+
+      - name: Upload dist folder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-monitor-windows-dist
+          path: dist/
+          if-no-files-found: error
