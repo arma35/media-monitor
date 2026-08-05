@@ -1,15 +1,21 @@
 # Local settings (copy from settings.example.txt). Never overwrite on update.
 #
-# article_date_not_older_than — YYYY-MM-DD
-#   Keep hits where article publish date is on or after this day
-#   ("дата не старше" / статьи с этой даты и новее).
-#   Example: 2020-01-01  →  take 2020, 2021, … 2026, skip 2019 and older.
-#   If publish date is not found on the page — still include the hit.
-#   Empty value = no date filter.
+# article_date_not_later_than — YYYY-MM-DD  ("дата ДО")
+#   Keep hits with publish date on or before this day.
+#   Empty value = today.
 #
-#   Old name article_date_not_later_than is still accepted (same meaning now).
+# article_date_not_older_than — YYYY-MM-DD  ("не старше")
+#   Keep hits with publish date on or after this day.
+#   Empty value = no lower bound.
+#
+# Example: from 2020-01-01 through today
+#   article_date_not_later_than=
+#   article_date_not_older_than=2020-01-01
+#
+# If publish date is not found on the page — still include the hit.
 #
 # auth_timeout_seconds — how long to wait for login/password at start (default 180).
 
+article_date_not_later_than=
 article_date_not_older_than=
 auth_timeout_seconds=180

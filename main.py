@@ -16,7 +16,7 @@ from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable, TextIO
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,7 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.8"
+VERSION = "0.0.9"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -67,8 +67,10 @@ class Tee:
 
 @dataclass(frozen=True)
 class Settings:
-    # Keep articles with publish date on/after this day ("не старше").
+    # Articles with publish date on/after this day ("не старше"). Empty = no min.
     article_date_not_older_than: date | None
+    # Articles with publish date on/before this day ("дата ДО"). Empty = today.
+    article_date_not_later_than: date
     auth_timeout_seconds: int
 
 
@@ -129,13 +131,13 @@ def load_settings(path: Path) -> Settings:
         raw[key.strip().lower()] = value.strip()
 
     min_date: date | None = None
-    # Preferred key: not older than (articles from this date and newer).
-    date_raw = raw.get("article_date_not_older_than", "")
-    # Backward compatibility with the old inverted key name.
-    if not date_raw:
-        date_raw = raw.get("article_date_not_later_than", "")
-    if date_raw:
-        min_date = date.fromisoformat(date_raw)
+    older_raw = raw.get("article_date_not_older_than", "")
+    if older_raw:
+        min_date = date.fromisoformat(older_raw)
+
+    # "дата ДО": empty means today
+    later_raw = raw.get("article_date_not_later_than", "")
+    max_date = date.fromisoformat(later_raw) if later_raw else date.today()
 
     timeout = DEFAULT_AUTH_TIMEOUT
     timeout_raw = raw.get("auth_timeout_seconds", "")
@@ -144,6 +146,7 @@ def load_settings(path: Path) -> Settings:
 
     return Settings(
         article_date_not_older_than=min_date,
+        article_date_not_later_than=max_date,
         auth_timeout_seconds=timeout,
     )
 
@@ -685,16 +688,22 @@ def phrase_present(text: str, phrase: str) -> bool:
     return needle in haystack
 
 
-def passes_date_filter(published: date | None, min_date: date | None) -> bool:
+def passes_date_filter(
+    published: date | None,
+    min_date: date | None,
+    max_date: date | None,
+) -> bool:
     """
-    If min_date is set: keep hits with published >= min_date ("не старше").
-    If published date is unknown — keep (include in report).
+    Keep if min_date <= published <= max_date.
+    Unknown publish date — keep (include in report).
     """
-    if min_date is None:
-        return True
     if published is None:
         return True
-    return published >= min_date
+    if min_date is not None and published < min_date:
+        return False
+    if max_date is not None and published > max_date:
+        return False
+    return True
 
 
 def scan_page(
@@ -716,7 +725,11 @@ def scan_page(
     published = extract_published_date(soup, url)
     text = extract_main_text(soup)
 
-    if not passes_date_filter(published, settings.article_date_not_older_than):
+    if not passes_date_filter(
+        published,
+        settings.article_date_not_older_than,
+        settings.article_date_not_later_than,
+    ):
         return []
 
     published_str = published.isoformat() if published else ""
@@ -735,41 +748,72 @@ def scan_page(
     return hits
 
 
+MAX_EXPAND_LINKS = 80
+MAX_SCAN_URLS = 250
+
+
+def site_search_urls(origin: str, phrase: str) -> list[str]:
+    """Common on-site search endpoints (helps find older articles not on homepage)."""
+    q = quote(phrase)
+    base = origin.rstrip("/")
+    return [
+        f"{base}/search/?q={q}",
+        f"{base}/?s={q}",
+        f"{base}/search?query={q}",
+        f"{base}/search?text={q}",
+    ]
+
+
 def collect_urls_to_scan(
     seed_urls: Iterable[str],
+    phrases: list[str],
     session: requests.Session,
     auth: tuple[str, str] | None,
 ) -> list[str]:
     """
-    Scan each configured URL. If a seed looks like a listing/home page,
-    also include same-host article links found there (capped).
+    Build scan list from seeds:
+    1) seed URLs themselves
+    2) article links from listing pages (1 hop)
+    3) site search results for each phrase (finds older articles)
     """
     result: list[str] = []
     seen: set[str] = set()
 
-    for seed in seed_urls:
-        url = normalize_url(seed)
-        if url in seen:
-            continue
+    def add(url: str) -> None:
+        if url in seen or len(result) >= MAX_SCAN_URLS:
+            return
         seen.add(url)
         result.append(url)
 
-        path = urlparse(url).path.rstrip("/")
-        # Heuristic:
-        # - root-like pages and category-like pages often contain "listing" links to articles
-        # - deep article URLs are usually longer and should not be expanded further
+    def add_links_from(page_url: str) -> None:
+        try:
+            html = fetch_html(page_url, session, auth=auth)
+            _, _, _, links = extract_page(html, page_url)
+            for link in links[:MAX_EXPAND_LINKS]:
+                add(link)
+        except AuthRequiredError as exc:
+            print(f"  [skip auth] cannot expand {page_url}: {exc}")
+        except requests.RequestException as exc:
+            print(f"  [warn] cannot expand {page_url}: {exc}")
+
+    origins: set[str] = set()
+    for seed in seed_urls:
+        url = normalize_url(seed)
+        add(url)
+        parsed = urlparse(url)
+        origins.add(f"{parsed.scheme}://{parsed.netloc}")
+
+        path = parsed.path.rstrip("/")
         if path.count("/") <= 2:
-            try:
-                html = fetch_html(url, session, auth=auth)
-                _, _, _, links = extract_page(html, url)
-                for link in links[:40]:
-                    if link not in seen:
-                        seen.add(link)
-                        result.append(link)
-            except AuthRequiredError as exc:
-                print(f"  [skip auth] cannot expand {url}: {exc}")
-            except requests.RequestException as exc:
-                print(f"  [warn] cannot expand {url}: {exc}")
+            add_links_from(url)
+
+    for origin in sorted(origins):
+        for phrase in phrases:
+            for search_url in site_search_urls(origin, phrase):
+                if len(result) >= MAX_SCAN_URLS:
+                    break
+                print(f"  search: {search_url}")
+                add_links_from(search_url)
 
     return result
 
@@ -853,14 +897,14 @@ def run() -> int:
     print(f"Sites: {sites_path.name}")
     print(f"Words: {words_path.name}")
     print(f"Settings: {settings_path.name}")
-    if settings.article_date_not_older_than:
-        print(
-            "Filter: article date not older than "
-            f"{settings.article_date_not_older_than.isoformat()} "
-            "(unknown dates are kept)"
-        )
-    else:
-        print("Filter: article date — off")
+    older = settings.article_date_not_older_than
+    later = settings.article_date_not_later_than
+    print(
+        "Filter dates: "
+        f"not older than {older.isoformat() if older else '(off)'}, "
+        f"not later than {later.isoformat()} "
+        "(unknown publish dates are kept)"
+    )
 
     if not sites:
         print("ERROR: sites.txt is empty (no URLs).")
@@ -877,7 +921,7 @@ def run() -> int:
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
 
     print("Collecting pages…")
-    urls = collect_urls_to_scan(sites, session, auth)
+    urls = collect_urls_to_scan(sites, phrases, session, auth)
     print(f"Will scan {len(urls)} page(s).")
 
     hits: list[Hit] = []
