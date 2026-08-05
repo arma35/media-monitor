@@ -6,6 +6,7 @@ Configs and reports live next to the executable (USB-friendly).
 from __future__ import annotations
 
 import getpass
+import json
 import re
 import shutil
 import sys
@@ -23,7 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -293,6 +294,85 @@ def parse_date_value(raw: str) -> date | None:
         except ValueError:
             continue
 
+    # Dates written in text, e.g. "5 августа 2026", "5 Aug 2026".
+    months_ru = {
+        "января": 1,
+        "янв.": 1,
+        "янв": 1,
+        "февраля": 2,
+        "февр.": 2,
+        "фев": 2,
+        "марта": 3,
+        "март.": 3,
+        "мар": 3,
+        "апреля": 4,
+        "апр.": 4,
+        "апр": 4,
+        "мая": 5,
+        "май.": 5,
+        "май": 5,
+        "июня": 6,
+        "июн.": 6,
+        "июн": 6,
+        "июля": 7,
+        "июл.": 7,
+        "июл": 7,
+        "августа": 8,
+        "авг.": 8,
+        "авг": 8,
+        "сентября": 9,
+        "сен.": 9,
+        "сен": 9,
+        "сент": 9,
+        "октября": 10,
+        "окт.": 10,
+        "окт": 10,
+        "ноября": 11,
+        "ноя.": 11,
+        "ноя": 11,
+        "декабря": 12,
+        "дек.": 12,
+        "дек": 12,
+    }
+    months_en = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+
+    m = re.search(r"(?i)(\d{1,2})\s*([a-zа-яё\.]+)\s*(\d{4})", value)
+    if m:
+        day = int(m.group(1))
+        mon_raw = m.group(2).strip().lower()
+        year = int(m.group(3))
+        mon = months_ru.get(mon_raw) or months_en.get(mon_raw)
+        if mon:
+            try:
+                return date(year, mon, day)
+            except ValueError:
+                return None
+
     # RFC 2822
     try:
         return parsedate_to_datetime(value).date()
@@ -300,8 +380,68 @@ def parse_date_value(raw: str) -> date | None:
         return None
 
 
+def extract_date_from_jsonld(soup: BeautifulSoup) -> date | None:
+    """
+    Many sites store publish date inside JSON-LD scripts (e.g. datePublished).
+    """
+
+    def find_in_obj(obj: object) -> date | None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if not isinstance(v, str):
+                    # Sometimes date is nested or provided as an object.
+                    nested = find_in_obj(v)
+                    if nested:
+                        return nested
+                    continue
+
+                key = str(k).lower()
+                if key in {
+                    "datepublished",
+                    "datecreated",
+                    "uploaddate",
+                    "publishedat",
+                    "publicationdate",
+                    "releasedate",
+                }:
+                    parsed = parse_date_value(v)
+                    if parsed:
+                        return parsed
+
+                nested = find_in_obj(v)
+                if nested:
+                    return nested
+
+        elif isinstance(obj, list):
+            for item in obj:
+                nested = find_in_obj(item)
+                if nested:
+                    return nested
+
+        return None
+
+    for script in soup.find_all("script", attrs={"type": lambda x: x and "ld+json" in x}):
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        parsed = find_in_obj(data)
+        if parsed:
+            return parsed
+
+    return None
+
+
 def extract_published_date(soup: BeautifulSoup) -> date | None:
     meta_candidates: list[str] = []
+
+    # Prefer JSON-LD if present (common for news portals).
+    jsonld_date = extract_date_from_jsonld(soup)
+    if jsonld_date:
+        return jsonld_date
 
     for prop in (
         "article:published_time",
