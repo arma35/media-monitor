@@ -24,7 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.6"
+VERSION = "0.0.7"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -380,44 +380,48 @@ def parse_date_value(raw: str) -> date | None:
         return None
 
 
+ARTICLE_JSONLD_TYPES = {
+    "newsarticle",
+    "article",
+    "blogposting",
+    "reportagenewsarticle",
+    "analysisnewsarticle",
+    "opinionnewsarticle",
+    "reviewnewsarticle",
+}
+
+
+def _jsonld_types(obj: dict) -> set[str]:
+    raw = obj.get("@type")
+    if isinstance(raw, str):
+        return {raw.lower()}
+    if isinstance(raw, list):
+        return {str(x).lower() for x in raw}
+    return set()
+
+
 def extract_date_from_jsonld(soup: BeautifulSoup) -> date | None:
-    """
-    Many sites store publish date inside JSON-LD scripts (e.g. datePublished).
-    """
+    """Prefer datePublished only from Article/NewsArticle JSON-LD nodes."""
 
-    def find_in_obj(obj: object) -> date | None:
+    def walk(obj: object) -> date | None:
         if isinstance(obj, dict):
-            for k, v in obj.items():
-                if not isinstance(v, str):
-                    # Sometimes date is nested or provided as an object.
-                    nested = find_in_obj(v)
-                    if nested:
-                        return nested
-                    continue
-
-                key = str(k).lower()
-                if key in {
-                    "datepublished",
-                    "datecreated",
-                    "uploaddate",
-                    "publishedat",
-                    "publicationdate",
-                    "releasedate",
-                }:
-                    parsed = parse_date_value(v)
-                    if parsed:
-                        return parsed
-
-                nested = find_in_obj(v)
+            types = _jsonld_types(obj)
+            if types & ARTICLE_JSONLD_TYPES:
+                for key in ("datePublished", "dateCreated", "uploadDate"):
+                    value = obj.get(key)
+                    if isinstance(value, str):
+                        parsed = parse_date_value(value)
+                        if parsed:
+                            return parsed
+            for value in obj.values():
+                nested = walk(value)
                 if nested:
                     return nested
-
         elif isinstance(obj, list):
             for item in obj:
-                nested = find_in_obj(item)
+                nested = walk(item)
                 if nested:
                     return nested
-
         return None
 
     for script in soup.find_all("script", attrs={"type": lambda x: x and "ld+json" in x}):
@@ -428,27 +432,100 @@ def extract_date_from_jsonld(soup: BeautifulSoup) -> date | None:
             data = json.loads(raw)
         except Exception:
             continue
-        parsed = find_in_obj(data)
+        parsed = walk(data)
         if parsed:
             return parsed
-
     return None
 
 
-def extract_published_date(soup: BeautifulSoup) -> date | None:
-    meta_candidates: list[str] = []
+def page_looks_like_article(soup: BeautifulSoup, url: str) -> bool:
+    """
+    Company cards / listings often have WordPress article:* meta but are not news.
+    """
+    path = urlparse(url).path.lower()
+    non_article_prefixes = (
+        "/kompanii/",
+        "/company/",
+        "/companies/",
+        "/category/",
+        "/tag/",
+        "/author/",
+        "/page/",
+        "/about/",
+        "/contact",
+        "/reklama",
+        "/advert",
+    )
+    if any(path.startswith(p) or f"{p.rstrip('/')}/" in path + "/" for p in non_article_prefixes):
+        # /category/ and /kompanii/ are not articles to report
+        if path.startswith(("/kompanii/", "/company/", "/companies/", "/category/", "/tag/", "/author/")):
+            return False
 
-    # Prefer JSON-LD if present (common for news portals).
+    og_type = soup.find("meta", property="og:type")
+    if og_type and str(og_type.get("content", "")).lower() in {"website", "profile", "business.business"}:
+        # Still allow if JSON-LD says NewsArticle
+        pass
+
+    for script in soup.find_all("script", attrs={"type": lambda x: x and "ld+json" in x}):
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        def has_article(obj: object) -> bool:
+            if isinstance(obj, dict):
+                if _jsonld_types(obj) & ARTICLE_JSONLD_TYPES:
+                    return True
+                return any(has_article(v) for v in obj.values())
+            if isinstance(obj, list):
+                return any(has_article(x) for x in obj)
+            return False
+
+        if has_article(data):
+            return True
+
+    if og_type and str(og_type.get("content", "")).lower() in {"article", "news"}:
+        return True
+
+    # Path heuristic: /YYYY/MM/slug or long news slug with date-ish segments
+    if re.search(r"/\d{4}/\d{2}/", path):
+        return True
+
+    # Explicit non-article sections
+    if path.startswith(("/kompanii/", "/company/", "/companies/")):
+        return False
+
+    # Default: treat as candidate article if it has an article body node
+    for sel in (
+        "article .entry-content",
+        ".entry-content",
+        ".post-content",
+        ".td-post-content",
+        "article",
+    ):
+        node = soup.select_one(sel)
+        if node and len(node.get_text(" ", strip=True)) >= 200:
+            # But reject short company cards wrapped in <article>
+            if path.startswith(("/kompanii/", "/company/", "/companies/", "/category/")):
+                return False
+            return True
+    return False
+
+
+def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
+    # Only trust dates on pages that look like articles.
+    if url and not page_looks_like_article(soup, url):
+        return None
+
     jsonld_date = extract_date_from_jsonld(soup)
     if jsonld_date:
         return jsonld_date
 
-    for prop in (
-        "article:published_time",
-        "og:published_time",
-        "article:modified_time",
-        "og:updated_time",
-    ):
+    meta_candidates: list[str] = []
+    for prop in ("article:published_time", "og:published_time"):
         tag = soup.find("meta", property=prop)
         if tag and tag.get("content"):
             meta_candidates.append(str(tag["content"]))
@@ -457,7 +534,6 @@ def extract_published_date(soup: BeautifulSoup) -> date | None:
         "pubdate",
         "publish-date",
         "publication_date",
-        "date",
         "DC.date",
         "dc.date",
         "sailthru.date",
@@ -484,18 +560,91 @@ def extract_published_date(soup: BeautifulSoup) -> date | None:
     return None
 
 
-def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[str]]:
-    """Return (title, published_date, text, same-host links)."""
-    soup = BeautifulSoup(html, "lxml")
-    title = extract_title(soup)
-    published = extract_published_date(soup)
-
-    for tag in soup(["script", "style", "noscript", "svg", "template"]):
+def extract_main_text(soup: BeautifulSoup) -> str:
+    """
+    Search phrases only in main content — not header/nav/footer/sidebar chrome
+    (otherwise hits like 'Срочные новости – в нашем Telegram' leak into reports).
+    """
+    work = BeautifulSoup(str(soup), "lxml")
+    for tag in work(
+        ["script", "style", "noscript", "svg", "template", "nav", "header", "footer", "aside"]
+    ):
         tag.decompose()
 
-    text = soup.get_text(separator=" ", strip=True)
-    if len(text) > MAX_PAGE_CHARS:
-        text = text[:MAX_PAGE_CHARS]
+    junk_re = re.compile(
+        r"(sidebar|widget|menu|nav|footer|header|share|social|telegram|subscribe|banner|advert|rekla)",
+        re.I,
+    )
+    for tag in list(work.find_all(True)):
+        if not getattr(tag, "attrs", None):
+            continue
+        cid = " ".join(tag.get("class") or [])
+        tid = str(tag.get("id") or "")
+        if junk_re.search(f"{cid} {tid}"):
+            tag.decompose()
+
+    for sel in (
+        "article .entry-content",
+        ".entry-content",
+        ".post-content",
+        ".td-post-content",
+        ".article-body",
+        ".post-body",
+        "article",
+        "main",
+        "[role=main]",
+        "#content",
+    ):
+        node = work.select_one(sel)
+        if node:
+            text = node.get_text(separator=" ", strip=True)
+            if len(text) >= 80:
+                return text[:MAX_PAGE_CHARS]
+
+    text = work.get_text(separator=" ", strip=True)
+    return text[:MAX_PAGE_CHARS]
+
+
+NON_ARTICLE_PATH_PREFIXES = (
+    "/kompanii/",
+    "/company/",
+    "/companies/",
+    "/category/",
+    "/tag/",
+    "/author/",
+    "/page/",
+    "/wp-admin/",
+    "/wp-login",
+    "/about/",
+    "/contact",
+    "/reklama",
+    "/advert",
+    "/feed",
+    "/search",
+    "/login",
+    "/register",
+)
+
+
+def is_probable_article_url(url: str) -> bool:
+    path = urlparse(url).path.lower().rstrip("/") + "/"
+    if path == "/":
+        return False
+    for prefix in NON_ARTICLE_PATH_PREFIXES:
+        if path.startswith(prefix) or prefix.rstrip("/") == path.rstrip("/"):
+            return False
+    # pagination / query junk
+    if re.search(r"/page/\d+/?", path):
+        return False
+    return True
+
+
+def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[str]]:
+    """Return (title, published_date, main_text, same-host article-like links)."""
+    soup = BeautifulSoup(html, "lxml")
+    title = extract_title(soup)
+    published = extract_published_date(soup, base_url)
+    text = extract_main_text(soup)
 
     host = urlparse(base_url).netloc.lower()
     links: list[str] = []
@@ -511,6 +660,8 @@ def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[
         if parsed.netloc.lower() != host:
             continue
         clean = absolute.split("#", 1)[0]
+        if not is_probable_article_url(clean):
+            continue
         if clean not in seen:
             seen.add(clean)
             links.append(clean)
@@ -550,7 +701,15 @@ def scan_page(
     auth: tuple[str, str] | None,
 ) -> list[Hit]:
     html = fetch_html(url, session, auth=auth)
-    title, published, text, _ = extract_page(html, url)
+    soup = BeautifulSoup(html, "lxml")
+
+    # Seeds may be categories; expanded company cards must not become report rows.
+    if not is_probable_article_url(url) and not page_looks_like_article(soup, url):
+        return []
+
+    title = extract_title(soup)
+    published = extract_published_date(soup, url)
+    text = extract_main_text(soup)
 
     if not passes_date_filter(published, settings.article_date_not_later_than):
         return []
