@@ -14,8 +14,13 @@
 #
 # If publish date is not found on the page — still include the hit.
 #
+# max_scan_urls — max pages to scan in one run. 0 = no limit.
+# max_expand_links — max links taken from one listing/search page.
+#
 # auth_timeout_seconds — how long to wait for login/password at start (default 180).
 
 article_date_not_later_than=
 article_date_not_older_than=
+max_scan_urls=0
+max_expand_links=120
 auth_timeout_seconds=180

@@ -19,12 +19,15 @@ from typing import Iterable, TextIO
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.9"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+VERSION = "0.0.10"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -72,6 +75,9 @@ class Settings:
     # Articles with publish date on/before this day ("дата ДО"). Empty = today.
     article_date_not_later_than: date
     auth_timeout_seconds: int
+    # 0 = no limit
+    max_scan_urls: int
+    max_expand_links: int
 
 
 @dataclass(frozen=True)
@@ -144,10 +150,22 @@ def load_settings(path: Path) -> Settings:
     if timeout_raw:
         timeout = max(1, int(timeout_raw))
 
+    max_scan = 0
+    max_scan_raw = raw.get("max_scan_urls", "")
+    if max_scan_raw:
+        max_scan = max(0, int(max_scan_raw))
+
+    max_expand = 120
+    max_expand_raw = raw.get("max_expand_links", "")
+    if max_expand_raw:
+        max_expand = max(1, int(max_expand_raw))
+
     return Settings(
         article_date_not_older_than=min_date,
         article_date_not_later_than=max_date,
         auth_timeout_seconds=timeout,
+        max_scan_urls=max_scan,
+        max_expand_links=max_expand,
     )
 
 
@@ -254,14 +272,30 @@ def fetch_html(
     session: requests.Session,
     auth: tuple[str, str] | None = None,
 ) -> str:
-    resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-    if resp.status_code in (401, 403) and auth:
-        resp = session.get(
+    def _get(verify: bool, use_auth: bool) -> requests.Response:
+        return session.get(
             url,
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
-            auth=auth,
+            auth=auth if use_auth else None,
+            verify=verify,
         )
+
+    verify = True
+    try:
+        resp = _get(verify=True, use_auth=False)
+    except requests.exceptions.SSLError as exc:
+        host = urlparse(url).netloc
+        print(f"  [ssl] certificate problem on {host}, retry without verify")
+        print(f"        ({exc.__class__.__name__})")
+        verify = False
+        resp = _get(verify=False, use_auth=False)
+
+    if resp.status_code in (401, 403) and auth:
+        try:
+            resp = _get(verify=verify, use_auth=True)
+        except requests.exceptions.SSLError:
+            resp = _get(verify=False, use_auth=True)
     if resp.status_code in (401, 403):
         raise AuthRequiredError(f"HTTP {resp.status_code} auth required/failed")
     resp.raise_for_status()
@@ -748,10 +782,6 @@ def scan_page(
     return hits
 
 
-MAX_EXPAND_LINKS = 80
-MAX_SCAN_URLS = 250
-
-
 def site_search_urls(origin: str, phrase: str) -> list[str]:
     """Common on-site search endpoints (helps find older articles not on homepage)."""
     q = quote(phrase)
@@ -769,52 +799,79 @@ def collect_urls_to_scan(
     phrases: list[str],
     session: requests.Session,
     auth: tuple[str, str] | None,
+    settings: Settings,
 ) -> list[str]:
     """
     Build scan list from seeds:
-    1) seed URLs themselves
-    2) article links from listing pages (1 hop)
-    3) site search results for each phrase (finds older articles)
+    1) seed URLs
+    2) site search for each phrase (priority — finds older articles)
+    3) article links from listing/home pages
     """
     result: list[str] = []
     seen: set[str] = set()
+    limit = settings.max_scan_urls  # 0 = unlimited
+    expand_cap = settings.max_expand_links
+
+    def full() -> bool:
+        return limit > 0 and len(result) >= limit
 
     def add(url: str) -> None:
-        if url in seen or len(result) >= MAX_SCAN_URLS:
+        if url in seen or full():
             return
         seen.add(url)
         result.append(url)
 
     def add_links_from(page_url: str) -> None:
+        if full():
+            return
         try:
             html = fetch_html(page_url, session, auth=auth)
             _, _, _, links = extract_page(html, page_url)
-            for link in links[:MAX_EXPAND_LINKS]:
+            for link in links[:expand_cap]:
                 add(link)
+                if full():
+                    return
         except AuthRequiredError as exc:
             print(f"  [skip auth] cannot expand {page_url}: {exc}")
         except requests.RequestException as exc:
             print(f"  [warn] cannot expand {page_url}: {exc}")
 
-    origins: set[str] = set()
+    seeds_norm: list[str] = []
+    origins: list[str] = []
+    seen_origins: set[str] = set()
     for seed in seed_urls:
         url = normalize_url(seed)
+        seeds_norm.append(url)
         add(url)
         parsed = urlparse(url)
-        origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in seen_origins:
+            seen_origins.add(origin)
+            origins.append(origin)
 
-        path = parsed.path.rstrip("/")
-        if path.count("/") <= 2:
-            add_links_from(url)
-
-    for origin in sorted(origins):
+    # Priority: on-site search by keywords (before homepage flood fills the queue)
+    for origin in origins:
+        if full():
+            break
         for phrase in phrases:
+            if full():
+                break
             for search_url in site_search_urls(origin, phrase):
-                if len(result) >= MAX_SCAN_URLS:
+                if full():
                     break
                 print(f"  search: {search_url}")
                 add_links_from(search_url)
 
+    # Then expand seed listing/home pages
+    for url in seeds_norm:
+        if full():
+            break
+        path = urlparse(url).path.rstrip("/")
+        if path.count("/") <= 2:
+            add_links_from(url)
+
+    if limit > 0 and len(result) >= limit:
+        print(f"  [limit] reached max_scan_urls={limit}")
     return result
 
 
@@ -905,6 +962,12 @@ def run() -> int:
         f"not later than {later.isoformat()} "
         "(unknown publish dates are kept)"
     )
+    scan_limit = settings.max_scan_urls
+    print(
+        f"Scan limits: max_scan_urls="
+        f"{'unlimited' if scan_limit == 0 else scan_limit}, "
+        f"max_expand_links={settings.max_expand_links}"
+    )
 
     if not sites:
         print("ERROR: sites.txt is empty (no URLs).")
@@ -921,7 +984,7 @@ def run() -> int:
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
 
     print("Collecting pages…")
-    urls = collect_urls_to_scan(sites, phrases, session, auth)
+    urls = collect_urls_to_scan(sites, phrases, session, auth, settings)
     print(f"Will scan {len(urls)} page(s).")
 
     hits: list[Hit] = []
