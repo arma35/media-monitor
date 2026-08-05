@@ -45,10 +45,17 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist\reports | Out-Null
+          New-Item -ItemType File -Force -Path dist\reports\.gitkeep | Out-Null
           Copy-Item -Force sites.example.txt, words.example.txt, settings.example.txt, exclude.example.txt dist\
-          if (Test-Path ИНСТРУКЦИЯ.txt) { Copy-Item -Force ИНСТРУКЦИЯ.txt dist\ }
-          if (Test-Path ИНСТРУКЦИЯ.docx) { Copy-Item -Force ИНСТРУКЦИЯ.docx dist\ }
           if (Test-Path VERSION) { Copy-Item -Force VERSION dist\ }
+
+          # ASCII filenames avoid zip encoding issues with Cyrillic on Windows
+          $instrTxt = Get-ChildItem -File -Filter "*.txt" | Where-Object {
+            $_.Name -eq ([string]([char]0x0418) + [char]0x041D + [char]0x0421 + [char]0x0422 + [char]0x0420 + [char]0x0423 + [char]0x041A + [char]0x0426 + [char]0x0418 + [char]0x042F + ".txt")
+          } | Select-Object -First 1
+          $instrDocx = Get-ChildItem -File -Filter "*.docx" | Select-Object -First 1
+          if ($instrTxt) { Copy-Item -LiteralPath $instrTxt.FullName -Destination dist\INSTRUCTION.txt -Force }
+          if ($instrDocx) { Copy-Item -LiteralPath $instrDocx.FullName -Destination dist\INSTRUCTION.docx -Force }
 
           foreach ($name in @("sites", "words", "settings", "exclude")) {
             $target = "dist\$name.txt"
@@ -58,19 +65,25 @@ jobs:
             }
           }
 
-          if (Test-Path dist\setting.txt) {
-            Remove-Item -Force dist\setting.txt
-          }
+          if (Test-Path dist\setting.txt) { Remove-Item -Force dist\setting.txt }
 
-          Get-ChildItem dist | Format-Table Name, Length
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length | Format-Table -AutoSize
 
       - name: Zip dist
         shell: pwsh
         run: |
           $version = (Get-Content VERSION -Raw).Trim()
           $zipName = "media-monitor-v$version-windows.zip"
-          if (Test-Path $zipName) { Remove-Item -Force $zipName }
-          Compress-Archive -Path dist\* -DestinationPath $zipName
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = Join-Path (Get-Location) $zipName
+          $distPath = Join-Path (Get-Location) "dist"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $distPath,
+            $zipPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
           Write-Host "Created $zipName"
           Get-Item $zipName | Format-List Name, Length, FullName
 
@@ -79,11 +92,4 @@ jobs:
         with:
           name: media-monitor-windows
           path: media-monitor-v*-windows.zip
-          if-no-files-found: error
-
-      - name: Upload dist folder artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: media-monitor-windows-dist
-          path: dist/
           if-no-files-found: error
