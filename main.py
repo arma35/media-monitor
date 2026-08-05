@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.15"
+VERSION = "1.0.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -37,7 +37,8 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT = 25
 MAX_PAGE_CHARS = 500_000
-LOG_NAME = "media-monitor.txt"
+LOG_NAME = "media-monitor_log.txt"
+LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_AUTH_TIMEOUT = 180
 
 
@@ -990,6 +991,34 @@ def collect_urls_to_scan(
     return result
 
 
+def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
+    """Keep log file at most max_bytes by trimming oldest content."""
+    if not log_path.is_file():
+        return
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return
+    if size <= max_bytes:
+        return
+    try:
+        data = log_path.read_bytes()
+        # Keep the newest half of the allowed size (with a small headroom).
+        keep = max_bytes // 2
+        trimmed = data[-keep:]
+        # Start on a newline boundary when possible.
+        nl = trimmed.find(b"\n")
+        if 0 <= nl < len(trimmed) - 1:
+            trimmed = trimmed[nl + 1 :]
+        header = (
+            f"===== log trimmed to ~{keep // (1024 * 1024)}MB "
+            f"(limit {max_bytes // (1024 * 1024)}MB) =====\n"
+        ).encode("utf-8")
+        log_path.write_bytes(header + trimmed)
+    except OSError:
+        pass
+
+
 def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = generated_at.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1005,11 +1034,19 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
         "дата выхода статьи",
         "название статьи",
         "дата время скана",
+        "версия ПО",
+        "время генерации",
     )
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical="center")
+
+    # F1 / G1: version and report generation time (as requested)
+    ws["F1"] = f"v{VERSION}"
+    ws["G1"] = generated_at.strftime("%Y-%m-%d %H:%M:%S")
+    ws["F1"].font = Font(bold=True)
+    ws["G1"].font = Font(bold=True)
 
     for hit in hits:
         ws.append(
@@ -1019,6 +1056,8 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
                 hit.published_at,
                 hit.title,
                 hit.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "",
+                "",
             )
         )
 
@@ -1028,7 +1067,7 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
             cell.hyperlink = str(cell.value)
             cell.style = "Hyperlink"
 
-    widths = (36, 70, 20, 50, 22)
+    widths = (36, 70, 20, 50, 22, 14, 20)
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
 
@@ -1162,6 +1201,7 @@ def wait_for_enter() -> None:
 def main() -> int:
     root = app_dir()
     log_path = root / LOG_NAME
+    rotate_log_if_needed(log_path)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     log_file = open(log_path, "a", encoding="utf-8")
@@ -1180,6 +1220,7 @@ def main() -> int:
         ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"===== media-monitor v{VERSION} end {ended} =====\n")
         log_file.close()
+        rotate_log_if_needed(log_path)
         # Always pause in the Windows exe so the console stays readable.
         if getattr(sys, "frozen", False):
             wait_for_enter()

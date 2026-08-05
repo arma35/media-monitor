@@ -36,6 +36,8 @@ copy /Y "sites.example.txt" "dist\sites.example.txt" >nul
 copy /Y "words.example.txt" "dist\words.example.txt" >nul
 copy /Y "settings.example.txt" "dist\settings.example.txt" >nul
 copy /Y "exclude.example.txt" "dist\exclude.example.txt" >nul
+if exist "ИНСТРУКЦИЯ.txt" copy /Y "ИНСТРУКЦИЯ.txt" "dist\ИНСТРУКЦИЯ.txt" >nul
+if exist "VERSION" copy /Y "VERSION" "dist\VERSION" >nul
 
 REM Create local configs from examples ONLY if missing — never overwrite user files
 if not exist "dist\sites.txt" (
@@ -77,6 +79,7 @@ echo ============================================
 echo   media-monitor.exe
 echo   settings.example.txt  ^(образец, обновляется^)
 echo   settings.txt / sites.txt / words.txt / exclude.txt  ^(ваши, не затираются^)
+echo   ИНСТРУКЦИЯ.txt
 echo   reports\
 echo Copy the whole dist\ folder anywhere ^(USB OK^).
 echo.

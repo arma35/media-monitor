@@ -13,7 +13,8 @@ settings.txt
 exclude.txt
 setting.txt
 
-# Runtime log (appendable)
+# Runtime log (appendable, auto-trimmed at 10MB)
+media-monitor_log.txt
 media-monitor.txt
 
 # Generated reports
