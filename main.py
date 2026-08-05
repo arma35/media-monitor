@@ -24,7 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.7"
+VERSION = "0.0.8"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -67,7 +67,8 @@ class Tee:
 
 @dataclass(frozen=True)
 class Settings:
-    article_date_not_later_than: date | None
+    # Keep articles with publish date on/after this day ("не старше").
+    article_date_not_older_than: date | None
     auth_timeout_seconds: int
 
 
@@ -127,10 +128,14 @@ def load_settings(path: Path) -> Settings:
         key, value = line.split("=", 1)
         raw[key.strip().lower()] = value.strip()
 
-    max_date: date | None = None
-    date_raw = raw.get("article_date_not_later_than", "")
+    min_date: date | None = None
+    # Preferred key: not older than (articles from this date and newer).
+    date_raw = raw.get("article_date_not_older_than", "")
+    # Backward compatibility with the old inverted key name.
+    if not date_raw:
+        date_raw = raw.get("article_date_not_later_than", "")
     if date_raw:
-        max_date = date.fromisoformat(date_raw)
+        min_date = date.fromisoformat(date_raw)
 
     timeout = DEFAULT_AUTH_TIMEOUT
     timeout_raw = raw.get("auth_timeout_seconds", "")
@@ -138,7 +143,7 @@ def load_settings(path: Path) -> Settings:
         timeout = max(1, int(timeout_raw))
 
     return Settings(
-        article_date_not_later_than=max_date,
+        article_date_not_older_than=min_date,
         auth_timeout_seconds=timeout,
     )
 
@@ -680,16 +685,16 @@ def phrase_present(text: str, phrase: str) -> bool:
     return needle in haystack
 
 
-def passes_date_filter(published: date | None, max_date: date | None) -> bool:
+def passes_date_filter(published: date | None, min_date: date | None) -> bool:
     """
-    If max_date is set: keep hits with published <= max_date.
+    If min_date is set: keep hits with published >= min_date ("не старше").
     If published date is unknown — keep (include in report).
     """
-    if max_date is None:
+    if min_date is None:
         return True
     if published is None:
         return True
-    return published <= max_date
+    return published >= min_date
 
 
 def scan_page(
@@ -711,7 +716,7 @@ def scan_page(
     published = extract_published_date(soup, url)
     text = extract_main_text(soup)
 
-    if not passes_date_filter(published, settings.article_date_not_later_than):
+    if not passes_date_filter(published, settings.article_date_not_older_than):
         return []
 
     published_str = published.isoformat() if published else ""
@@ -848,10 +853,10 @@ def run() -> int:
     print(f"Sites: {sites_path.name}")
     print(f"Words: {words_path.name}")
     print(f"Settings: {settings_path.name}")
-    if settings.article_date_not_later_than:
+    if settings.article_date_not_older_than:
         print(
-            "Filter: article date not later than "
-            f"{settings.article_date_not_later_than.isoformat()} "
+            "Filter: article date not older than "
+            f"{settings.article_date_not_older_than.isoformat()} "
             "(unknown dates are kept)"
         )
     else:
