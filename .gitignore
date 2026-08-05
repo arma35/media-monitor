@@ -11,6 +11,7 @@ sites.txt
 words.txt
 settings.txt
 setting.txt
+exclude.txt
 
 # Runtime log (appendable)
 media-monitor.txt

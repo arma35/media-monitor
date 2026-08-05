@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.12"
+VERSION = "0.0.13"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -820,16 +820,30 @@ def passes_date_filter(
 ) -> bool:
     """
     Keep if min_date <= published <= max_date.
-    If a min-date ("не старше") is set and publish date is unknown — exclude.
+    Unknown publish date — always keep (include in report).
     """
     if published is None:
-        # Without a date we cannot prove the article is new enough.
-        return min_date is None
+        return True
     if min_date is not None and published < min_date:
         return False
     if max_date is not None and published > max_date:
         return False
     return True
+
+
+def normalize_exclude_url(url: str) -> str:
+    url = normalize_url(url).strip()
+    return url.split("#", 1)[0].rstrip("/")
+
+
+def load_exclude_urls(path: Path) -> set[str]:
+    return {normalize_exclude_url(line) for line in load_lines(path)}
+
+
+def is_excluded_url(url: str, excluded: set[str]) -> bool:
+    if not excluded:
+        return False
+    return normalize_exclude_url(url) in excluded
 
 
 def scan_page(
@@ -839,7 +853,11 @@ def scan_page(
     scanned_at: datetime,
     settings: Settings,
     auth: tuple[str, str] | None,
+    excluded: set[str] | None = None,
 ) -> list[Hit]:
+    if excluded and is_excluded_url(url, excluded):
+        return []
+
     html = fetch_html(url, session, auth=auth)
     soup = BeautifulSoup(html, "lxml")
 
@@ -1037,6 +1055,7 @@ def run() -> int:
     try:
         sites_path = ensure_local_config(root, "sites.txt")
         words_path = ensure_local_config(root, "words.txt")
+        exclude_path = ensure_local_config(root, "exclude.txt")
 
         # Prefer user-provided `setting.txt` (singular), but if only `settings.txt` exists,
         # copy it to `setting.txt` so their edits are preserved.
@@ -1052,6 +1071,7 @@ def run() -> int:
             settings_path = ensure_local_config(root, "setting.txt")
         sites = load_lines(sites_path)
         phrases = load_lines(words_path)
+        excluded = load_exclude_urls(exclude_path)
         settings = load_settings(settings_path)
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}")
@@ -1061,19 +1081,15 @@ def run() -> int:
 
     print(f"Sites: {sites_path.name}")
     print(f"Words: {words_path.name}")
+    print(f"Exclude: {exclude_path.name} ({len(excluded)} URL(s))")
     print(f"Settings: {settings_path.name}")
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
-    unknown_note = (
-        "unknown publish dates are EXCLUDED when 'not older than' is set"
-        if older
-        else "unknown publish dates are kept"
-    )
     print(
         "Filter dates: "
         f"not older than {older.isoformat() if older else '(off)'}, "
         f"not later than {later.isoformat()} "
-        f"({unknown_note})"
+        "(unknown publish dates are kept)"
     )
     scan_limit = settings.max_scan_urls
     print(
@@ -1102,6 +1118,12 @@ def run() -> int:
 
     print("Collecting pages…")
     urls = collect_urls_to_scan(sites, phrases, session, auth, settings)
+    if excluded:
+        before = len(urls)
+        urls = [u for u in urls if not is_excluded_url(u, excluded)]
+        skipped = before - len(urls)
+        if skipped:
+            print(f"Excluded from scan by exclude.txt: {skipped}")
     print(f"Will scan {len(urls)} page(s).")
 
     hits: list[Hit] = []
@@ -1110,7 +1132,9 @@ def run() -> int:
     for i, url in enumerate(urls, start=1):
         print(f"[{i}/{len(urls)}] {url}")
         try:
-            page_hits = scan_page(url, phrases, session, scanned_at, settings, auth)
+            page_hits = scan_page(
+                url, phrases, session, scanned_at, settings, auth, excluded
+            )
             if page_hits:
                 print(f"  → {len(page_hits)} hit(s)")
                 hits.extend(page_hits)

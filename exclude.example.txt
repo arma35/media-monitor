@@ -1,0 +1,9 @@
+# One URL per line — these articles will NOT appear in the report.
+# Lines starting with # are ignored.
+#
+# Copy this file to exclude.txt and edit your list:
+#   copy exclude.example.txt exclude.txt
+#
+# Example:
+# https://gubdaily.ru/news/v-trollejbusax-petrozavodska-zarabotala-karta-trojka/
+
