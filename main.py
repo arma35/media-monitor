@@ -24,7 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-VERSION = "0.0.5"
+VERSION = "0.0.6"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -591,7 +591,10 @@ def collect_urls_to_scan(
         result.append(url)
 
         path = urlparse(url).path.rstrip("/")
-        if path.count("/") <= 1:
+        # Heuristic:
+        # - root-like pages and category-like pages often contain "listing" links to articles
+        # - deep article URLs are usually longer and should not be expanded further
+        if path.count("/") <= 2:
             try:
                 html = fetch_html(url, session, auth=auth)
                 _, _, _, links = extract_page(html, url)
