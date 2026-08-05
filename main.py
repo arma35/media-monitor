@@ -28,18 +28,22 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
-REQUEST_TIMEOUT = 25
+# (connect timeout, read timeout) — fail faster on dead/hanging hosts
+REQUEST_TIMEOUT = (5, 20)
 MAX_PAGE_CHARS = 500_000
 LOG_NAME = "media-monitor_log.txt"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_AUTH_TIMEOUT = 180
+
+# Hosts that already failed cert verification this run — skip verify next time.
+_INSECURE_SSL_HOSTS: set[str] = set()
 
 
 class AuthRequiredError(Exception):
@@ -80,6 +84,8 @@ class Settings:
     # 0 = no limit
     max_scan_urls: int
     max_expand_links: int
+    # True = verify TLS certs (with per-host fallback cache); False = never verify.
+    ssl_verify: bool
 
 
 @dataclass(frozen=True)
@@ -165,12 +171,18 @@ def load_settings(path: Path) -> Settings:
     if max_expand_raw:
         max_expand = max(1, int(max_expand_raw))
 
+    ssl_verify = True
+    ssl_raw = raw.get("ssl_verify", "1").strip().lower()
+    if ssl_raw in {"0", "false", "no", "off", "нет"}:
+        ssl_verify = False
+
     return Settings(
         article_date_not_older_than=min_date,
         article_date_not_later_than=max_date,
         auth_timeout_seconds=timeout,
         max_scan_urls=max_scan,
         max_expand_links=max_expand,
+        ssl_verify=ssl_verify,
     )
 
 
@@ -276,7 +288,10 @@ def fetch_html(
     url: str,
     session: requests.Session,
     auth: tuple[str, str] | None = None,
+    ssl_verify: bool = True,
 ) -> str:
+    host = urlparse(url).netloc.lower()
+
     def _get(verify: bool, use_auth: bool) -> requests.Response:
         return session.get(
             url,
@@ -286,20 +301,24 @@ def fetch_html(
             verify=verify,
         )
 
-    verify = True
+    # After the first SSL failure for a host, never pay the double-request cost again.
+    verify = bool(ssl_verify) and host not in _INSECURE_SSL_HOSTS
     try:
-        resp = _get(verify=True, use_auth=False)
-    except requests.exceptions.SSLError as exc:
-        host = urlparse(url).netloc
-        print(f"  [ssl] у {host} проблема цепочки сертификата (в браузере ок — у Windows свой список CA).")
-        print("        Повтор запроса без проверки SSL…")
-        verify = False
+        resp = _get(verify=verify, use_auth=False)
+    except requests.exceptions.SSLError:
+        if host not in _INSECURE_SSL_HOSTS:
+            _INSECURE_SSL_HOSTS.add(host)
+            print(
+                f"  [ssl] у {host} битый сертификат — дальше для этого сайта "
+                "без проверки SSL (быстрее)."
+            )
         resp = _get(verify=False, use_auth=False)
 
     if resp.status_code in (401, 403) and auth:
         try:
-            resp = _get(verify=verify, use_auth=True)
+            resp = _get(verify=verify and host not in _INSECURE_SSL_HOSTS, use_auth=True)
         except requests.exceptions.SSLError:
+            _INSECURE_SSL_HOSTS.add(host)
             resp = _get(verify=False, use_auth=True)
     if resp.status_code in (401, 403):
         raise AuthRequiredError(f"HTTP {resp.status_code} auth required/failed")
@@ -862,7 +881,7 @@ def scan_page(
     if excluded and is_excluded_url(url, excluded):
         return []
 
-    html = fetch_html(url, session, auth=auth)
+    html = fetch_html(url, session, auth=auth, ssl_verify=settings.ssl_verify)
     soup = BeautifulSoup(html, "lxml")
 
     # Seeds may be categories; expanded company cards must not become report rows.
@@ -941,7 +960,9 @@ def collect_urls_to_scan(
         if full():
             return
         try:
-            html = fetch_html(page_url, session, auth=auth)
+            html = fetch_html(
+                page_url, session, auth=auth, ssl_verify=settings.ssl_verify
+            )
             _, _, _, links = extract_page(html, page_url)
             for link in links[:expand_cap]:
                 add(link)
@@ -1098,6 +1119,7 @@ def run() -> int:
 
     print(f"media-monitor v{VERSION}")
     print(f"Working directory: {root}")
+    _INSECURE_SSL_HOSTS.clear()
 
     try:
         sites_path = ensure_local_config(root, "sites.txt")
@@ -1133,6 +1155,7 @@ def run() -> int:
         f"{'unlimited' if scan_limit == 0 else scan_limit}, "
         f"max_expand_links={settings.max_expand_links}"
     )
+    print(f"SSL verify: {'on' if settings.ssl_verify else 'off (быстрее на госсайтах)'}")
 
     if not sites:
         print("ERROR: sites.txt is empty (no URLs).")
