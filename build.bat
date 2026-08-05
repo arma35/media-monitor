@@ -13,8 +13,14 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
+REM Read version from VERSION file (fallback to main.py)
+set "APP_VERSION=unknown"
+if exist "VERSION" (
+  set /p APP_VERSION=<VERSION
+)
+
 echo.
-echo Building portable exe...
+echo Building media-monitor v%APP_VERSION% ...
 pyinstaller --noconfirm --clean --onefile --name media-monitor ^
   --distpath dist ^
   --workpath build ^
@@ -25,13 +31,13 @@ echo.
 echo Preparing dist folder...
 if not exist "dist\reports" mkdir "dist\reports"
 
-REM Always refresh examples (safe to overwrite)
+REM Always refresh examples (safe to overwrite) — образец настроек обновляется всегда
 copy /Y "sites.example.txt" "dist\sites.example.txt" >nul
 copy /Y "words.example.txt" "dist\words.example.txt" >nul
 copy /Y "settings.example.txt" "dist\settings.example.txt" >nul
 copy /Y "exclude.example.txt" "dist\exclude.example.txt" >nul
 
-REM Create local configs from examples ONLY if missing — never overwrite
+REM Create local configs from examples ONLY if missing — never overwrite user files
 if not exist "dist\sites.txt" (
   copy /Y "sites.example.txt" "dist\sites.txt" >nul
   echo Created dist\sites.txt from example
@@ -57,19 +63,20 @@ if not exist "dist\exclude.txt" (
   echo Kept existing dist\exclude.txt
 )
 
-REM Create singular config alias (setting.txt) if missing
-if not exist "dist\setting.txt" (
-  copy /Y "settings.example.txt" "dist\setting.txt" >nul
-  echo Created dist\setting.txt from example
-) else (
-  echo Kept existing dist\setting.txt
+REM Remove legacy singular setting.txt if present (now only settings.txt)
+if exist "dist\setting.txt" (
+  del /Q "dist\setting.txt" >nul 2>nul
+  echo Removed legacy dist\setting.txt ^(use settings.txt^)
 )
 
 echo.
-echo Done. Portable folder: dist\
+echo ============================================
+echo  Build OK: media-monitor v%APP_VERSION%
+echo  Output: dist\media-monitor.exe
+echo ============================================
 echo   media-monitor.exe
-echo   *.example.txt                                          ^(samples in git^)
-echo   sites.txt / words.txt / settings.txt / exclude.txt     ^(local, not overwritten^)
+echo   settings.example.txt  ^(образец, обновляется^)
+echo   settings.txt / sites.txt / words.txt / exclude.txt  ^(ваши, не затираются^)
 echo   reports\
 echo Copy the whole dist\ folder anywhere ^(USB OK^).
 echo.

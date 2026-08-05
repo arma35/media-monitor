@@ -1,24 +1,25 @@
-# Local settings (copy from settings.example.txt → setting.txt / settings.txt).
-# Never overwritten on update if the local file already exists.
-#
-# article_date_not_later_than — YYYY-MM-DD  ("дата ДО")
-#   Empty = today.
-#
-# article_date_not_older_than — YYYY-MM-DD  ("не старше")
-#   Empty = no lower bound.
-#
-# If publish date is not found — hit is still kept in the report.
-#
-# max_scan_urls — 0 = no limit
-# max_expand_links — max links from one listing/search page
-# auth_timeout_seconds — login/password wait at start
+# Пример настроек media-monitor.
+# Рабочий файл — settings.txt (создаётся из этого примера один раз, потом не перезаписывается).
+# Этот файл settings.example.txt можно обновлять при новых версиях — это только образец.
 
-#дата ДО, если не задано то сегодня
+# Дата ДО (включительно). Формат: ГГГГ-ММ-ДД.
+# Берутся статьи с датой выхода не позже этой.
+# Если пусто — используется сегодняшняя дата.
 article_date_not_later_than=
 
-#дата НЕ старше
+# Дата НЕ СТАРШЕ (включительно). Формат: ГГГГ-ММ-ДД.
+# Берутся статьи с датой выхода не раньше этой.
+# Если пусто — нижней границы нет.
+# Если у статьи дата не найдена — статья всё равно попадает в отчёт.
 article_date_not_older_than=
 
-max_scan_urls=0
-max_expand_links=120
+# Сколько секунд ждать ввод логина/пароля при старте (для сайтов с авторизацией).
+# Пустой логин или таймаут = работать без авторизации.
 auth_timeout_seconds=180
+
+# Максимум страниц для сканирования за один запуск.
+# 0 = без ограничения.
+max_scan_urls=0
+
+# Максимум ссылок, которые берутся с одной страницы списка/поиска.
+max_expand_links=120

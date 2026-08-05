@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.14"
+VERSION = "0.0.15"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -98,14 +98,7 @@ def ensure_local_config(root: Path, name: str) -> Path:
     target = root / name
     if target.is_file():
         return target
-
-    # Backward/forward compatibility:
-    # - historically user asked for `setting.txt` (singular)
-    # - example file is `settings.example.txt` (plural)
-    if name.lower() == "setting.txt":
-        example = root / "settings.example.txt"
-    else:
-        example = root / name.replace(".txt", ".example.txt")
+    example = root / name.replace(".txt", ".example.txt")
     if example.is_file():
         shutil.copy2(example, target)
         print(f"Created {name} from {example.name} (edit it for your list).")
@@ -116,43 +109,14 @@ def ensure_local_config(root: Path, name: str) -> Path:
     )
 
 
-def _settings_key_count(path: Path) -> int:
-    count = 0
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip() and value.strip() != "":
-            count += 1
-        elif key.strip():
-            # empty value still counts as a declared setting key
-            count += 1
-    return count
-
-
 def resolve_settings_path(root: Path) -> Path:
-    """
-    Working file is setting.txt.
-    If settings.txt exists and is newer / has more keys — sync it into setting.txt.
-    """
-    singular = root / "setting.txt"
-    plural = root / "settings.txt"
-
-    if plural.is_file() and singular.is_file():
-        plural_newer = plural.stat().st_mtime >= singular.stat().st_mtime
-        plural_richer = _settings_key_count(plural) > _settings_key_count(singular)
-        if plural_newer or plural_richer:
-            shutil.copy2(plural, singular)
-            print("Synced settings.txt -> setting.txt")
-        return singular
-    if plural.is_file() and not singular.is_file():
-        shutil.copy2(plural, singular)
-        print("Created setting.txt from settings.txt")
-        return singular
-    if singular.is_file():
-        return singular
-    return ensure_local_config(root, "setting.txt")
+    """Only settings.txt. Migrate legacy setting.txt once if needed."""
+    settings = root / "settings.txt"
+    legacy = root / "setting.txt"
+    if not settings.is_file() and legacy.is_file():
+        shutil.copy2(legacy, settings)
+        print("Migrated setting.txt -> settings.txt (use only settings.txt from now on).")
+    return ensure_local_config(root, "settings.txt")
 
 
 def load_lines(path: Path) -> list[str]:
@@ -1104,6 +1068,7 @@ def run() -> int:
         print(f"ERROR: {exc}")
         elapsed = time.monotonic() - started_mono
         print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        print(f"media-monitor v{VERSION}")
         return 1
 
     print(f"Sites: {sites_path.name}")
@@ -1129,11 +1094,13 @@ def run() -> int:
         print("ERROR: sites.txt is empty (no URLs).")
         elapsed = time.monotonic() - started_mono
         print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        print(f"media-monitor v{VERSION}")
         return 1
     if not phrases:
         print("ERROR: words.txt is empty (no keywords/phrases).")
         elapsed = time.monotonic() - started_mono
         print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        print(f"media-monitor v{VERSION}")
         return 1
 
     print(f"Loaded {len(sites)} site(s), {len(phrases)} phrase(s).")
@@ -1181,6 +1148,7 @@ def run() -> int:
     )
     print(f"Report: {report_path}")
     print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+    print(f"media-monitor v{VERSION}")
     return 0
 
 
@@ -1210,7 +1178,7 @@ def main() -> int:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_file.write(f"===== end {ended} =====\n")
+        log_file.write(f"===== media-monitor v{VERSION} end {ended} =====\n")
         log_file.close()
         # Always pause in the Windows exe so the console stays readable.
         if getattr(sys, "frozen", False):

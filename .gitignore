@@ -10,8 +10,8 @@ build/
 sites.txt
 words.txt
 settings.txt
-setting.txt
 exclude.txt
+setting.txt
 
 # Runtime log (appendable)
 media-monitor.txt
