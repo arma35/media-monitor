@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -991,6 +991,17 @@ def collect_urls_to_scan(
     return result
 
 
+def format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м {s}с"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+
 def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
     """Keep log file at most max_bytes by trimming oldest content."""
     if not log_path.is_file():
@@ -1019,7 +1030,12 @@ def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None
         pass
 
 
-def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> Path:
+def write_report(
+    hits: list[Hit],
+    reports_dir: Path,
+    generated_at: datetime,
+    duration_seconds: float,
+) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = generated_at.strftime("%Y-%m-%d_%H-%M-%S")
     out_path = reports_dir / f"media-monitor-{stamp}.xlsx"
@@ -1035,16 +1051,16 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
         "название статьи",
         "дата время скана",
         "версия ПО",
-        "время генерации",
+        "длительность генерации",
     )
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical="center")
 
-    # F1 / G1: version and report generation time (as requested)
+    # F1 — версия ПО; G1 — длительность генерации отчёта
     ws["F1"] = f"v{VERSION}"
-    ws["G1"] = generated_at.strftime("%Y-%m-%d %H:%M:%S")
+    ws["G1"] = format_duration(duration_seconds)
     ws["F1"].font = Font(bold=True)
     ws["G1"].font = Font(bold=True)
 
@@ -1067,23 +1083,12 @@ def write_report(hits: list[Hit], reports_dir: Path, generated_at: datetime) -> 
             cell.hyperlink = str(cell.value)
             cell.style = "Hyperlink"
 
-    widths = (36, 70, 20, 50, 22, 14, 20)
+    widths = (36, 70, 20, 50, 22, 14, 22)
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
 
     wb.save(out_path)
     return out_path
-
-
-def format_duration(seconds: float) -> str:
-    total = int(round(seconds))
-    h, rem = divmod(total, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}ч {m}м {s}с"
-    if m:
-        return f"{m}м {s}с"
-    return f"{s}с"
 
 
 def run() -> int:
@@ -1178,7 +1183,9 @@ def run() -> int:
             errors += 1
             print(f"  [error] {exc}")
 
-    report_path = write_report(hits, reports_dir, datetime.now())
+    report_path = write_report(
+        hits, reports_dir, datetime.now(), time.monotonic() - started_mono
+    )
     elapsed = time.monotonic() - started_mono
     print()
     print(

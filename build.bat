@@ -28,6 +28,13 @@ pyinstaller --noconfirm --clean --onefile --name media-monitor ^
 if errorlevel 1 exit /b 1
 
 echo.
+echo Building user instruction DOCX...
+python build_instruction_docx.py
+if errorlevel 1 (
+  echo WARNING: failed to build ИНСТРУКЦИЯ.docx
+)
+
+echo.
 echo Preparing dist folder...
 if not exist "dist\reports" mkdir "dist\reports"
 
@@ -37,6 +44,7 @@ copy /Y "words.example.txt" "dist\words.example.txt" >nul
 copy /Y "settings.example.txt" "dist\settings.example.txt" >nul
 copy /Y "exclude.example.txt" "dist\exclude.example.txt" >nul
 if exist "ИНСТРУКЦИЯ.txt" copy /Y "ИНСТРУКЦИЯ.txt" "dist\ИНСТРУКЦИЯ.txt" >nul
+if exist "ИНСТРУКЦИЯ.docx" copy /Y "ИНСТРУКЦИЯ.docx" "dist\ИНСТРУКЦИЯ.docx" >nul
 if exist "VERSION" copy /Y "VERSION" "dist\VERSION" >nul
 
 REM Create local configs from examples ONLY if missing — never overwrite user files
@@ -79,7 +87,7 @@ echo ============================================
 echo   media-monitor.exe
 echo   settings.example.txt  ^(образец, обновляется^)
 echo   settings.txt / sites.txt / words.txt / exclude.txt  ^(ваши, не затираются^)
-echo   ИНСТРУКЦИЯ.txt
+echo   ИНСТРУКЦИЯ.docx / ИНСТРУКЦИЯ.txt
 echo   reports\
 echo Copy the whole dist\ folder anywhere ^(USB OK^).
 echo.
