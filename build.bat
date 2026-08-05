@@ -65,4 +65,6 @@ echo   *.example.txt                          ^(samples in git^)
 echo   sites.txt / words.txt / settings.txt   ^(local, not overwritten^)
 echo   reports\
 echo Copy the whole dist\ folder anywhere ^(USB OK^).
+echo.
+pause
 endlocal

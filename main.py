@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERSION = "0.0.10"
+VERSION = "0.0.11"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -286,8 +286,8 @@ def fetch_html(
         resp = _get(verify=True, use_auth=False)
     except requests.exceptions.SSLError as exc:
         host = urlparse(url).netloc
-        print(f"  [ssl] certificate problem on {host}, retry without verify")
-        print(f"        ({exc.__class__.__name__})")
+        print(f"  [ssl] у {host} проблема цепочки сертификата (в браузере ок — у Windows свой список CA).")
+        print("        Повтор запроса без проверки SSL…")
         verify = False
         resp = _get(verify=False, use_auth=False)
 
@@ -532,8 +532,12 @@ def page_looks_like_article(soup: BeautifulSoup, url: str) -> bool:
     if og_type and str(og_type.get("content", "")).lower() in {"article", "news"}:
         return True
 
-    # Path heuristic: /YYYY/MM/slug or long news slug with date-ish segments
+    # Path heuristic: /YYYY/MM/slug, /YYYYMMDD-..., /news/
     if re.search(r"/\d{4}/\d{2}/", path):
+        return True
+    if re.search(r"/\d{8}(?:-\d+)?/?", path):
+        return True
+    if "/news/" in path or path.rstrip("/").endswith("/news"):
         return True
 
     # Explicit non-article sections
@@ -546,6 +550,8 @@ def page_looks_like_article(soup: BeautifulSoup, url: str) -> bool:
         ".entry-content",
         ".post-content",
         ".td-post-content",
+        ".detailed-page",
+        ".news-detail",
         "article",
     ):
         node = soup.select_one(sel)
@@ -557,9 +563,51 @@ def page_looks_like_article(soup: BeautifulSoup, url: str) -> bool:
     return False
 
 
+def extract_date_from_url(url: str) -> date | None:
+    path = urlparse(url).path
+    m = re.search(r"/(\d{4})(\d{2})(\d{2})(?:-|/|$)", path)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    m = re.search(r"/(\d{4})/(\d{2})/(\d{2})(?:/|$)", path)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
+    selectors = (
+        ".detailed-page__date",
+        ".news-date",
+        ".publication-date",
+        ".pub-date",
+        ".date",
+        "time",
+        "[class*='date']",
+        "[class*='Date']",
+    )
+    for sel in selectors:
+        for el in soup.select(sel)[:8]:
+            raw = el.get("datetime") or el.get_text(" ", strip=True)
+            if not raw:
+                continue
+            parsed = parse_date_value(str(raw))
+            if parsed:
+                return parsed
+    return None
+
+
 def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
-    # Only trust dates on pages that look like articles.
-    if url and not page_looks_like_article(soup, url):
+    # Skip only obvious non-articles (company cards / categories).
+    if url and not page_looks_like_article(soup, url) and not is_probable_article_url(url):
+        return None
+    path = urlparse(url).path.lower() if url else ""
+    if path.startswith(("/kompanii/", "/company/", "/companies/", "/category/", "/tag/")):
         return None
 
     jsonld_date = extract_date_from_jsonld(soup)
@@ -599,6 +647,13 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
         parsed = parse_date_value(raw)
         if parsed:
             return parsed
+
+    visible = extract_date_from_visible(soup)
+    if visible:
+        return visible
+
+    if url:
+        return extract_date_from_url(url)
     return None
 
 
@@ -1014,25 +1069,37 @@ def run() -> int:
     return 0
 
 
+def wait_for_enter() -> None:
+    try:
+        input("\nНажмите Enter для выхода...")
+    except EOFError:
+        pass
+
+
 def main() -> int:
     root = app_dir()
     log_path = root / LOG_NAME
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     log_file = open(log_path, "a", encoding="utf-8")
+    code = 1
     try:
         started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"\n===== media-monitor v{VERSION} start {started} =====\n")
         log_file.flush()
         sys.stdout = Tee(original_stdout, log_file)  # type: ignore[assignment]
         sys.stderr = Tee(original_stderr, log_file)  # type: ignore[assignment]
-        return run()
+        code = run()
+        return code
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"===== end {ended} =====\n")
         log_file.close()
+        # Always pause in the Windows exe so the console stays readable.
+        if getattr(sys, "frozen", False):
+            wait_for_enter()
 
 
 if __name__ == "__main__":
