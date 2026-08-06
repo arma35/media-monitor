@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -18,13 +19,25 @@ import main as mm
 class GuiLog:
     """Queue lines from worker threads; drained on the Tk main thread."""
 
-    def __init__(self, root: tk.Tk, widget: scrolledtext.ScrolledText) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        widget: scrolledtext.ScrolledText,
+        *,
+        max_lines: int = 0,
+    ) -> None:
         self.root = root
         self.widget = widget
         self.q: queue.Queue[str] = queue.Queue()
+        self.max_lines = max_lines
 
     def write_line(self, line: str) -> None:
         self.q.put(line)
+
+    def clear(self) -> None:
+        self.widget.configure(state="normal")
+        self.widget.delete("1.0", "end")
+        self.widget.configure(state="disabled")
 
     def pump(self) -> None:
         try:
@@ -32,26 +45,35 @@ class GuiLog:
                 line = self.q.get_nowait()
                 self.widget.configure(state="normal")
                 self.widget.insert("end", line)
+                if self.max_lines > 0:
+                    last = int(float(self.widget.index("end-1c")))
+                    if last > self.max_lines:
+                        self.widget.delete("1.0", f"{last - self.max_lines}.0")
                 self.widget.see("end")
                 self.widget.configure(state="disabled")
         except queue.Empty:
             pass
-        self.root.after(100, self.pump)
+        self.root.after(80, self.pump)
 
 
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(f"Media Monitor v{mm.VERSION}")
-        self.root.geometry("860x560")
-        self.root.minsize(640, 420)
+        self.root.geometry("920x600")
+        self.root.minsize(700, 460)
 
         self.worker: threading.Thread | None = None
         self.running = False
         self.last_report: Path | None = None
+        self._progress_q: queue.Queue[dict] = queue.Queue()
+        self._cached_workers = 0
+        self._run_started_mono: float | None = None
+        self._elapsed_job: str | None = None
 
         self._build()
         self._refresh_counts()
+        self._pump_progress()
 
     def _build(self) -> None:
         root = self.root
@@ -63,6 +85,9 @@ class App:
         self.status = ttk.Label(top, text="Готов к запуску", font=("Segoe UI", 11))
         self.status.pack(side="left")
 
+        self.elapsed_lbl = ttk.Label(top, text="Время: —", font=("Segoe UI", 11))
+        self.elapsed_lbl.pack(side="left", padx=(16, 0))
+
         self.version_lbl = ttk.Label(top, text=f"v{mm.VERSION}")
         self.version_lbl.pack(side="right")
 
@@ -70,6 +95,13 @@ class App:
         info.pack(fill="x", **pad)
         self.info_lbl = ttk.Label(info, text="")
         self.info_lbl.pack(anchor="w")
+        self.dates_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
+        self.dates_lbl.pack(anchor="w", pady=(2, 0))
+        self.progress_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
+        self.progress_lbl.pack(anchor="w", pady=(2, 0))
+
+        self.progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 4))
 
         btns = ttk.Frame(root)
         btns.pack(fill="x", **pad)
@@ -80,9 +112,6 @@ class App:
         self.btn_stop = ttk.Button(btns, text="Стоп", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(0, 6))
 
-        ttk.Button(btns, text="Папка программы", command=self.open_app_dir).pack(
-            side="left", padx=(0, 6)
-        )
         ttk.Button(btns, text="Отчёты", command=self.open_reports).pack(
             side="left", padx=(0, 6)
         )
@@ -96,24 +125,98 @@ class App:
             btns, text="settings.txt", command=lambda: self.open_file("settings.txt")
         ).pack(side="left", padx=(0, 6))
 
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self.notebook = notebook
+
+        tab_status = ttk.Frame(notebook)
+        tab_full = ttk.Frame(notebook)
+        notebook.add(tab_status, text="Статус")
+        notebook.add(tab_full, text="Полный лог")
+
         self.log = scrolledtext.ScrolledText(
-            root,
+            tab_status,
             wrap="word",
-            height=24,
+            height=22,
             state="disabled",
             font=("Consolas", 10),
         )
-        self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.full_log = scrolledtext.ScrolledText(
+            tab_full,
+            wrap="word",
+            height=22,
+            state="disabled",
+            font=("Consolas", 9),
+        )
+        self.full_log.pack(fill="both", expand=True, padx=2, pady=2)
 
         self.gui_log = GuiLog(root, self.log)
         self.gui_log.pump()
+        self.gui_detail = GuiLog(root, self.full_log, max_lines=8000)
+        self.gui_detail.pump()
 
         hint = ttk.Label(
             root,
-            text="Конфиги рядом с exe. Консольный режим: --console",
+            text=(
+                "«Статус» — кратко по сайтам. «Полный лог» — что качается прямо сейчас. "
+                "Стоп закрывает сеть сразу; Excel сохранится. Консоль: --console"
+            ),
             foreground="#555",
+            wraplength=880,
         )
         hint.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _format_elapsed(self, seconds: float) -> str:
+        total = max(0, int(seconds))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}ч {m:02d}м {s:02d}с"
+        if m:
+            return f"{m}м {s:02d}с"
+        return f"{s}с"
+
+    def _tick_elapsed(self) -> None:
+        self._elapsed_job = None
+        if self._run_started_mono is None:
+            return
+        elapsed = time.monotonic() - self._run_started_mono
+        self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
+        if self.running:
+            self._elapsed_job = self.root.after(250, self._tick_elapsed)
+
+    def _start_elapsed(self) -> None:
+        self._run_started_mono = time.monotonic()
+        self.elapsed_lbl.configure(text="Время: 0с")
+        if self._elapsed_job is not None:
+            try:
+                self.root.after_cancel(self._elapsed_job)
+            except Exception:
+                pass
+        self._elapsed_job = self.root.after(250, self._tick_elapsed)
+
+    def _stop_elapsed(self, *, freeze: bool = True) -> None:
+        if self._elapsed_job is not None:
+            try:
+                self.root.after_cancel(self._elapsed_job)
+            except Exception:
+                pass
+            self._elapsed_job = None
+        if freeze and self._run_started_mono is not None:
+            elapsed = time.monotonic() - self._run_started_mono
+            self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
+        elif not freeze:
+            self.elapsed_lbl.configure(text="Время: —")
+            self._run_started_mono = None
+
+    def _workers_from_settings(self, settings: mm.Settings, site_count: int) -> int:
+        if site_count <= 0:
+            return 0
+        if settings.site_workers > 0:
+            return max(1, min(settings.site_workers, site_count))
+        return site_count
 
     def _refresh_counts(self) -> None:
         root = mm.app_dir()
@@ -125,9 +228,87 @@ class App:
             words = len(mm.load_lines(mm.ensure_local_config(root, "words.txt")))
         except Exception:
             words = 0
+
+        workers = 0
+        try:
+            settings_path = mm.resolve_settings_path(root)
+            mm.sync_settings_file(settings_path)
+            settings = mm.load_settings(settings_path)
+            workers = self._workers_from_settings(settings, sites)
+            self._cached_workers = workers
+            eff_from, eff_to = mm.effective_article_date_range(
+                settings.article_date_not_older_than,
+                settings.article_date_not_later_than,
+                settings.article_date_last_days,
+            )
+            range_ru = mm.format_article_date_range_ru(eff_from, eff_to)
+            self.dates_lbl.configure(text=f"Статьи: {range_ru}")
+        except Exception:
+            self.dates_lbl.configure(text="Статьи: (не удалось прочитать settings.txt)")
+            workers = self._cached_workers
+
         self.info_lbl.configure(
-            text=f"Папка: {root}   |   сайтов: {sites}   |   фраз: {words}"
+            text=(
+                f"Папка: {root}   |   сайтов: {sites}   |   фраз: {words}   |   "
+                f"параллельно: {workers}"
+            )
         )
+        if not self.running:
+            self.progress_lbl.configure(text="")
+            self.progress_bar["value"] = 0
+
+    def _on_progress(self, snap: dict) -> None:
+        """Called from worker threads — queue for UI thread."""
+        self._progress_q.put(snap)
+
+    def _pump_progress(self) -> None:
+        latest: dict | None = None
+        try:
+            while True:
+                latest = self._progress_q.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self._apply_progress(latest)
+        self.root.after(150, self._pump_progress)
+
+    def _apply_progress(self, snap: dict) -> None:
+        done = int(snap.get("done", 0))
+        total = max(1, int(snap.get("total", 1)))
+        hits = int(snap.get("hits", 0))
+        active = int(snap.get("active", 0))
+        workers = int(snap.get("workers", self._cached_workers))
+        unavailable = int(snap.get("unavailable", 0))
+        cancelling = bool(snap.get("cancelling", False))
+        names = snap.get("active_names") or []
+
+        self.progress_bar["maximum"] = total
+        self.progress_bar["value"] = done
+
+        names_txt = ", ".join(names)
+        if active > len(names):
+            names_txt += f"… (+{active - len(names)})"
+
+        if cancelling:
+            self.status.configure(text="Остановка…")
+            self.progress_lbl.configure(
+                text=(
+                    f"Остановка: готово {done}/{total} | находок {hits} | "
+                    f"ещё выходят: {active} | параллельно {workers}. "
+                    "Сеть закрыта, Excel сохранится."
+                )
+            )
+        else:
+            self.status.configure(text=f"Сканирование… {done}/{total}")
+            line = (
+                f"Готово {done}/{total} | находок {hits} | "
+                f"сейчас качают {active} | параллельно {workers}"
+            )
+            if unavailable:
+                line += f" | недоступных {unavailable}"
+            if names_txt:
+                line += f" | {names_txt}"
+            self.progress_lbl.configure(text=line)
 
     def append(self, text: str) -> None:
         self.gui_log.write_line(text if text.endswith("\n") else text + "\n")
@@ -140,11 +321,15 @@ class App:
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.status.configure(text="Сканирование…")
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+        self.progress_lbl.configure(text="Запуск…")
+        self.progress_bar["value"] = 0
+        self._start_elapsed()
+        self.gui_log.clear()
+        self.gui_detail.clear()
         mm.clear_cancel()
         mm.set_log_callback(self.gui_log.write_line)
+        mm.set_detail_callback(self.gui_detail.write_line)
+        mm.set_progress_callback(self._on_progress)
 
         def work() -> None:
             code = 1
@@ -182,6 +367,8 @@ class App:
                     log_file.close()
                     mm.rotate_log_if_needed(mm.app_dir() / mm.LOG_NAME)
                 mm.set_log_callback(None)
+                mm.set_detail_callback(None)
+                mm.set_progress_callback(None)
                 self.root.after(0, lambda: self._on_done(code))
 
         self.worker = threading.Thread(target=work, daemon=True)
@@ -191,8 +378,9 @@ class App:
         self.running = False
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        self._stop_elapsed(freeze=True)
         if mm.is_cancelled():
-            self.status.configure(text="Остановлено")
+            self.status.configure(text="Остановлено — отчёт сохранён")
         elif code == 0:
             self.status.configure(text="Готово")
         else:
@@ -204,10 +392,10 @@ class App:
             return
         mm.request_cancel()
         self.status.configure(text="Остановка…")
-        self.append("Запрошена остановка…\n")
-
-    def open_app_dir(self) -> None:
-        self._open_path(mm.app_dir())
+        self.append(
+            "\nОстановка: закрываю сеть, новые страницы не берутся. "
+            "Excel сохранится с тем, что уже нашли.\n"
+        )
 
     def open_reports(self) -> None:
         path = mm.app_dir() / "reports"
