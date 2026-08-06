@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import warnings
+from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -32,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.1.0"
+VERSION = "3.3.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -50,12 +53,19 @@ DEFAULT_AUTH_TIMEOUT = 180
 _INSECURE_SSL_HOSTS: set[str] = set()
 _SSL_LOCK = threading.Lock()
 _PRINT_LOCK = threading.RLock()
+# Live HTTP sessions — closed on Stop to unblock workers stuck in network I/O.
+_ACTIVE_SESSIONS: set[requests.Session] = set()
+_SESSIONS_LOCK = threading.Lock()
 # Path to certifi + bundled Минцифры/extra CAs; set in run().
 _CA_BUNDLE: str | bool = True
 # When False, only progress/HIT/summary go to console (errors suppressed).
 _LOG_VERBOSE = False
 # Optional UI/log sink: receives each printed line (including trailing \n).
 _LOG_CALLBACK: Callable[[str], None] | None = None
+# Optional detailed UI sink (full log tab) — always receives detail lines.
+_DETAIL_CALLBACK: Callable[[str], None] | None = None
+# Optional live progress sink for GUI status panel (dict snapshot).
+_PROGRESS_CALLBACK: Callable[[dict], None] | None = None
 # Cooperative cancel for GUI Stop button.
 _CANCEL = threading.Event()
 
@@ -73,12 +83,55 @@ def set_log_callback(callback: Callable[[str], None] | None) -> None:
     _LOG_CALLBACK = callback
 
 
+def set_detail_callback(callback: Callable[[str], None] | None) -> None:
+    """Full-detail UI sink (always on for the «Полный лог» tab)."""
+    global _DETAIL_CALLBACK
+    _DETAIL_CALLBACK = callback
+
+
+def set_progress_callback(callback: Callable[[dict], None] | None) -> None:
+    global _PROGRESS_CALLBACK
+    _PROGRESS_CALLBACK = callback
+
+
+def register_session(session: requests.Session) -> None:
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.add(session)
+
+
+def unregister_session(session: requests.Session) -> None:
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.discard(session)
+
+
+def _close_all_sessions() -> int:
+    """Force-close live sessions so blocked GETs fail quickly on Stop."""
+    with _SESSIONS_LOCK:
+        sessions = list(_ACTIVE_SESSIONS)
+    closed = 0
+    for session in sessions:
+        try:
+            session.close()
+            closed += 1
+        except Exception:
+            pass
+    return closed
+
+
 def request_cancel() -> None:
     _CANCEL.set()
+    n = _close_all_sessions()
+    if n:
+        log_print(
+            f"Стоп: закрываю {n} сетевых соединений, "
+            "чтобы не ждать таймауты…"
+        )
 
 
 def clear_cancel() -> None:
     _CANCEL.clear()
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.clear()
 
 
 def is_cancelled() -> bool:
@@ -86,7 +139,7 @@ def is_cancelled() -> bool:
 
 
 def log_print(*args: object, **kwargs: object) -> None:
-    """Thread-safe print (whole line under one lock) + optional UI sink."""
+    """Thread-safe print (whole line under one lock) + optional UI sinks."""
     ensure_stdio()
     sep = str(kwargs.get("sep", " "))
     end = str(kwargs.get("end", "\n"))
@@ -102,12 +155,36 @@ def log_print(*args: object, **kwargs: object) -> None:
                 cb(line)
             except Exception:
                 pass
+        detail_cb = _DETAIL_CALLBACK
+        if detail_cb is not None:
+            try:
+                detail_cb(line)
+            except Exception:
+                pass
 
 
 def detail_print(*args: object, **kwargs: object) -> None:
-    """Extra diagnostics — only when log_verbose=1."""
-    if _LOG_VERBOSE:
-        log_print(*args, **kwargs)
+    """
+    Detailed progress (URL/search/errors).
+    Always goes to the GUI «Полный лог» tab when a detail callback is set.
+    Also printed to console/file when log_verbose=1.
+    """
+    ensure_stdio()
+    sep = str(kwargs.get("sep", " "))
+    end = str(kwargs.get("end", "\n"))
+    line = sep.join(str(a) for a in args) + end
+    with _PRINT_LOCK:
+        if _LOG_VERBOSE:
+            try:
+                print(*args, **kwargs)
+            except Exception:
+                pass
+        detail_cb = _DETAIL_CALLBACK
+        if detail_cb is not None:
+            try:
+                detail_cb(line)
+            except Exception:
+                pass
 
 
 def app_dir() -> Path:
@@ -231,25 +308,70 @@ class SiteResult:
 
 @dataclass
 class RunProgress:
+    """Live counters for UI / status lines (thread-safe)."""
+
     total_sites: int
+    workers: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     done: int = 0
     hits: int = 0
+    pages: int = 0
+    unavailable: int = 0
+    cancelled_sites: int = 0
     active: set[str] = field(default_factory=set)
 
     def site_start(self, label: str) -> None:
         with self._lock:
             self.active.add(label)
+        self._notify()
 
-    def site_done(self, label: str, hit_count: int) -> tuple[int, int, str]:
+    def site_done(
+        self,
+        label: str,
+        hit_count: int,
+        *,
+        pages: int = 0,
+        unavailable: bool = False,
+        cancelled: bool = False,
+    ) -> tuple[int, int]:
         with self._lock:
             self.active.discard(label)
             self.done += 1
             self.hits += hit_count
-            running = ", ".join(sorted(self.active)[:5])
-            if len(self.active) > 5:
-                running += f"... (+{len(self.active) - 5})"
-            return self.done, self.hits, running or "-"
+            self.pages += pages
+            if unavailable:
+                self.unavailable += 1
+            if cancelled:
+                self.cancelled_sites += 1
+            done = self.done
+            hits = self.hits
+        self._notify()
+        return done, hits
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            names = sorted(self.active)
+            return {
+                "done": self.done,
+                "total": self.total_sites,
+                "hits": self.hits,
+                "pages": self.pages,
+                "unavailable": self.unavailable,
+                "cancelled_sites": self.cancelled_sites,
+                "active": len(self.active),
+                "active_names": names[:6],
+                "workers": self.workers,
+                "cancelling": is_cancelled(),
+            }
+
+    def _notify(self) -> None:
+        cb = _PROGRESS_CALLBACK
+        if cb is None:
+            return
+        try:
+            cb(self.snapshot())
+        except Exception:
+            pass
 
 
 def ensure_local_config(root: Path, name: str) -> Path:
@@ -1175,6 +1297,35 @@ def phrase_present(text: str, phrase: str) -> bool:
     return True
 
 
+def effective_article_date_range(
+    min_date: date | None,
+    max_date: date,
+    recent_days: int = 0,
+    *,
+    today: date | None = None,
+) -> tuple[date | None, date]:
+    """
+    Compute the from/to window used by the article date filter.
+    If recent_days > 0 — [today - recent_days; today], ignoring min/max.
+    Otherwise — [min_date; max_date] (min_date may be None = no lower bound).
+    """
+    today = today or date.today()
+    if recent_days > 0:
+        lower = date.fromordinal(today.toordinal() - recent_days)
+        return lower, today
+    return min_date, max_date
+
+
+def format_article_date_range_ru(
+    min_date: date | None,
+    max_date: date,
+) -> str:
+    """Human-readable «с … по …» for UI/logs."""
+    if min_date is None:
+        return f"с (без нижней границы) по {max_date.isoformat()}"
+    return f"с {min_date.isoformat()} по {max_date.isoformat()}"
+
+
 def passes_date_filter(
     published: date | None,
     min_date: date | None,
@@ -1188,13 +1339,15 @@ def passes_date_filter(
     """
     if published is None:
         return True
-    if recent_days > 0:
-        today = date.today()
-        lower = today.fromordinal(today.toordinal() - recent_days)
-        return lower <= published <= today
-    if min_date is not None and published < min_date:
+    # max_date is always set by load_settings (defaults to today); keep Optional for callers.
+    eff_min, eff_max = effective_article_date_range(
+        min_date,
+        max_date if max_date is not None else date.today(),
+        recent_days,
+    )
+    if eff_min is not None and published < eff_min:
         return False
-    if max_date is not None and published > max_date:
+    if published > eff_max:
         return False
     return True
 
@@ -1321,6 +1474,8 @@ def collect_urls_for_site(
         result.append(url)
 
     def add_links_from(page_url: str) -> None:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             return
         try:
@@ -1332,25 +1487,37 @@ def collect_urls_for_site(
                 add(link)
                 if full():
                     return
+        except CancelledError:
+            raise
         except AuthRequiredError as exc:
             detail_print(f"  [{site_label}] [skip auth] cannot expand {page_url}: {exc}")
         except requests.RequestException as exc:
+            if is_cancelled():
+                raise CancelledError() from exc
             detail_print(f"  [{site_label}] [warn] cannot expand {page_url}: {exc}")
 
     for url in seed_urls:
+        if is_cancelled():
+            raise CancelledError()
         add(url)
 
     origin = f"{urlparse(seed_urls[0]).scheme}://{urlparse(seed_urls[0]).netloc}"
     for phrase in phrases:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             break
         for search_url in site_search_urls(origin, phrase):
+            if is_cancelled():
+                raise CancelledError()
             if full():
                 break
             detail_print(f"  [{site_label}] search: {search_url}")
             add_links_from(search_url)
 
     for url in seed_urls:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             break
         path = urlparse(url).path.rstrip("/")
@@ -1379,13 +1546,15 @@ def process_site(
     started = time.monotonic()
     if is_cancelled():
         result = SiteResult(origin=origin, label=label, fatal="cancelled")
+        progress.site_done(label, 0, cancelled=True)
         return result
 
     progress.site_start(label)
-    log_print(f"[{index}/{total}] >> {label}")
+    detail_print(f"→ старт {label} ({index}/{total})")
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
+    register_session(session)
 
     result = SiteResult(origin=origin, label=label)
     try:
@@ -1393,14 +1562,19 @@ def process_site(
             raise CancelledError()
 
         probe_url = seeds[0] if seeds else origin
+        detail_print(f"  [{label}] проверка доступности: {probe_url}")
         try:
             fetch_html(
                 probe_url, session, auth=auth, ssl_verify=settings.ssl_verify
             )
+            detail_print(f"  [{label}] сайт отвечает, собираю ссылки…")
         except AuthRequiredError:
             # Host responds — not "unavailable", auth handled later per page.
+            detail_print(f"  [{label}] отвечает (нужна авторизация), собираю ссылки…")
             pass
         except requests.RequestException as exc:
+            if is_cancelled():
+                raise CancelledError() from exc
             result.errors += 1
             result.unavailable = True
             detail_print(f"  [{label}] [error] сайт недоступен: {exc}")
@@ -1414,7 +1588,7 @@ def process_site(
             if excluded:
                 urls = [u for u in urls if not is_excluded_url(u, excluded)]
             result.pages_collected = len(urls)
-            log_print(f"  [{label}] к скану {len(urls)} стр.")
+            detail_print(f"  [{label}] к скану {len(urls)} стр.")
 
             for i, url in enumerate(urls, start=1):
                 if is_cancelled():
@@ -1427,10 +1601,16 @@ def process_site(
                     result.pages_scanned += 1
                     if page_hits:
                         result.hits.extend(page_hits)
+                        for hit in page_hits:
+                            detail_print(
+                                f"  [{label}] HIT «{hit.phrase}» {hit.url}"
+                            )
                 except AuthRequiredError as exc:
                     result.skipped_auth += 1
                     detail_print(f"  [{label}] [skip auth] {exc}")
                 except requests.RequestException as exc:
+                    if is_cancelled():
+                        raise CancelledError() from exc
                     result.errors += 1
                     detail_print(f"  [{label}] [error] {exc}")
 
@@ -1444,26 +1624,42 @@ def process_site(
                 result.unavailable = True
     except CancelledError:
         result.fatal = "cancelled"
-        log_print(f"[{index}/{total}] стоп {label}")
     except Exception as exc:  # noqa: BLE001 — site must not kill the pool
-        result.fatal = str(exc)
-        result.unavailable = True
-        detail_print(f"[{index}/{total}] FAIL {label} — {exc}")
+        if is_cancelled():
+            result.fatal = "cancelled"
+        else:
+            result.fatal = str(exc)
+            result.unavailable = True
+            detail_print(f"[{index}/{total}] FAIL {label} — {exc}")
+    finally:
+        unregister_session(session)
+        try:
+            session.close()
+        except Exception:
+            pass
 
     result.elapsed = time.monotonic() - started
-    done, hit_total, running = progress.site_done(label, len(result.hits))
-    if result.fatal == "cancelled":
-        pass
-    elif result.unavailable:
+    cancelled = result.fatal == "cancelled"
+    done, hit_total = progress.site_done(
+        label,
+        len(result.hits),
+        pages=result.pages_scanned,
+        unavailable=bool(result.unavailable and not cancelled),
+        cancelled=cancelled,
+    )
+    dur = format_duration(result.elapsed)
+    if cancelled:
         log_print(
-            f"[{done}/{total}] недоступен {label} "
-            f"({format_duration(result.elapsed)}) | HIT {hit_total}"
+            f"[{done}/{total}] остановлен  {label} "
+            f"(успели {result.pages_scanned} стр., {len(result.hits)} находок, {dur})"
         )
+    elif result.unavailable:
+        log_print(f"[{done}/{total}] недоступен  {label} ({dur})")
     else:
         log_print(
-            f"[{done}/{total}] {label} — {result.pages_scanned} стр., "
-            f"{len(result.hits)} HIT, {format_duration(result.elapsed)} "
-            f"| всего HIT {hit_total} | в работе: {running}"
+            f"[{done}/{total}] готово  {label} — "
+            f"{result.pages_scanned} стр., {len(result.hits)} находок ({dur}) "
+            f"| всего находок: {hit_total}"
         )
     return result
 
@@ -1477,6 +1673,23 @@ def format_duration(seconds: float) -> str:
     if m:
         return f"{m}м {s}с"
     return f"{s}с"
+
+
+def try_open_file(path: Path) -> bool:
+    """Open a file with the OS default app (Excel for .xlsx)."""
+    try:
+        if not path.is_file():
+            return False
+        if sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log_print(f"Не удалось открыть файл: {exc}")
+        return False
 
 
 def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
@@ -1589,7 +1802,6 @@ def run(*, interactive_auth: bool = True) -> int:
     clear_cancel()
 
     log_print(f"media-monitor v{VERSION}")
-    log_print(f"Working directory: {root}")
     with _SSL_LOCK:
         _INSECURE_SSL_HOSTS.clear()
 
@@ -1610,34 +1822,38 @@ def run(*, interactive_auth: bool = True) -> int:
         log_print(f"media-monitor v{VERSION}")
         return 1
 
-    log_print(f"Sites: {sites_path.name}")
-    log_print(f"Words: {words_path.name}")
-    log_print(f"Exclude: {exclude_path.name} ({len(excluded)} URL(s))")
-    log_print(f"Settings: {settings_path.name}")
+    log_print(f"Папка: {root}")
+    log_print(
+        f"Конфиги: {sites_path.name}, {words_path.name}, "
+        f"{settings_path.name}, {exclude_path.name}"
+        + (f" (исключено URL: {len(excluded)})" if excluded else "")
+    )
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
+    eff_from, eff_to = effective_article_date_range(
+        older, later, settings.article_date_last_days
+    )
+    range_ru = format_article_date_range_ru(eff_from, eff_to)
     if settings.article_date_last_days > 0:
         log_print(
-            "Filter dates: "
-            f"last {settings.article_date_last_days} day(s) from today "
-            "(overrides other date fields; unknown publish dates are kept)"
+            f"Период статей: {range_ru} "
+            f"(последние {settings.article_date_last_days} дн.; "
+            "статьи без даты тоже попадают в отчёт)"
         )
     else:
         log_print(
-            "Filter dates: "
-            f"not older than {older.isoformat() if older else '(off)'}, "
-            f"not later than {later.isoformat()} "
-            "(unknown publish dates are kept)"
+            f"Период статей: {range_ru} "
+            "(статьи без даты тоже попадают в отчёт)"
         )
     scan_limit = settings.max_scan_urls
     log_print(
-        f"Scan limits: max_scan_urls="
-        f"{'unlimited' if scan_limit == 0 else scan_limit} (на сайт), "
-        f"max_expand_links={settings.max_expand_links}"
+        "Лимиты: страниц на сайт = "
+        f"{'без лимита' if scan_limit == 0 else scan_limit}, "
+        f"ссылок со страницы = {settings.max_expand_links}"
     )
     log_print(
-        "SSL verify: "
-        + ("on (встроенные CA + Минцифры)" if settings.ssl_verify else "off (без проверки)")
+        "SSL: "
+        + ("проверка вкл. (встроенные CA + Минцифры)" if settings.ssl_verify else "без проверки")
     )
 
     if not sites:
@@ -1659,25 +1875,32 @@ def run(*, interactive_auth: bool = True) -> int:
     workers = max(1, min(workers, total_sites))
 
     log_print(
-        f"Loaded {total_sites} site(s), {len(phrases)} phrase(s). "
-        f"Parallel: {workers} worker(s) "
-        f"(внутри сайта — последовательно)."
+        f"К работе: {total_sites} сайт(ов), {len(phrases)} фраз(ы). "
+        f"Параллельно сайтов: {workers} "
+        f"(внутри каждого сайта запросы идут по одному)."
     )
     if settings.log_verbose:
-        log_print("log_verbose=1 — подробный лог URL.")
+        log_print("Подробный лог URL включён (log_verbose=1).")
+    else:
+        log_print(
+            "Вкладка «Статус» — итог по сайтам. "
+            "Вкладка «Полный лог» — что качается прямо сейчас. "
+            "Сводка также в верхней панели."
+        )
 
     if interactive_auth:
         auth = prompt_credentials(settings.auth_timeout_seconds)
     else:
         auth = None
-        log_print("Авторизация: пропуск (GUI).")
+        log_print("Авторизация: пропуск (режим окна).")
 
     scanned_at = datetime.now()
     global _CA_BUNDLE, _LOG_VERBOSE
     _LOG_VERBOSE = settings.log_verbose
     _CA_BUNDLE = build_ca_bundle() if settings.ssl_verify else False
 
-    progress = RunProgress(total_sites=total_sites)
+    progress = RunProgress(total_sites=total_sites, workers=workers)
+    progress._notify()
     hits: list[Hit] = []
     errors = 0
     skipped_auth = 0
@@ -1686,8 +1909,9 @@ def run(*, interactive_auth: bool = True) -> int:
     unavailable: list[str] = []
     unavailable_hosts: set[str] = set()
     cancelled = False
+    stopped_sites = 0
 
-    log_print("Scanning sites...")
+    log_print("Сканирование…")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
@@ -1706,13 +1930,21 @@ def run(*, interactive_auth: bool = True) -> int:
             for index, (origin, seeds) in enumerate(site_groups, start=1)
         }
         for fut in as_completed(futures):
+            # Soft-cancel: mark flag for workers, cancel queued tasks,
+            # but ALWAYS collect results so Excel keeps found hits.
             if is_cancelled():
                 cancelled = True
                 for pending in futures:
                     pending.cancel()
-                break
             try:
                 site_result = fut.result()
+            except FuturesCancelledError:
+                stopped_sites += 1
+                with progress._lock:
+                    progress.done += 1
+                    progress.cancelled_sites += 1
+                progress._notify()
+                continue
             except Exception as exc:  # noqa: BLE001
                 log_print(f"ERROR worker: {exc}")
                 errors += 1
@@ -1721,7 +1953,9 @@ def run(*, interactive_auth: bool = True) -> int:
             errors += site_result.errors
             skipped_auth += site_result.skipped_auth
             pages_total += site_result.pages_scanned
-            if site_result.fatal and site_result.fatal != "cancelled":
+            if site_result.fatal == "cancelled":
+                stopped_sites += 1
+            elif site_result.fatal:
                 fatal_sites += 1
                 errors += 1
             if site_result.unavailable:
@@ -1729,7 +1963,13 @@ def run(*, interactive_auth: bool = True) -> int:
                 unavailable_hosts.add(site_host_key(site_result.origin))
 
     if cancelled or is_cancelled():
-        log_print("Остановка по запросу пользователя…")
+        log_print()
+        log_print(
+            "Остановка завершена: сеть закрыта, оставшиеся страницы не сканировались."
+        )
+        if stopped_sites:
+            log_print(f"Остановлено сайтов: {stopped_sites}.")
+        log_print("Excel всё равно сохраняется с тем, что успели найти.")
 
     if unavailable and settings.comment_unavailable_sites:
         n = comment_unavailable_in_sites(sites_path, unavailable_hosts)
@@ -1750,15 +1990,19 @@ def run(*, interactive_auth: bool = True) -> int:
     elapsed = time.monotonic() - started_mono
     log_print()
     log_print(
-        f"Done. Sites: {total_sites}. Pages: {pages_total}. "
-        f"Hits: {len(hits)}. Errors: {errors}. "
-        f"Skipped (auth): {skipped_auth}."
-        + (f" Unavailable: {len(unavailable)}." if unavailable else "")
-        + (f" Fatal sites: {fatal_sites}." if fatal_sites else "")
-        + (" Cancelled." if cancelled or is_cancelled() else "")
+        f"Итог: сайтов {total_sites}, страниц {pages_total}, "
+        f"находок {len(hits)}, ошибок {errors}"
+        + (f", недоступных {len(unavailable)}" if unavailable else "")
+        + (f", остановлено {stopped_sites}" if stopped_sites else "")
+        + (f", пропуск auth {skipped_auth}" if skipped_auth else "")
+        + ("." if not (cancelled or is_cancelled()) else " (запуск прерван).")
     )
-    log_print(f"Report: {report_path}")
-    log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+    log_print(f"Отчёт: {report_path}")
+    if try_open_file(report_path):
+        log_print("Отчёт открыт в Excel (если установлено приложение по умолчанию).")
+    else:
+        log_print("Отчёт не удалось открыть автоматически — откройте папку «Отчёты».")
+    log_print(f"Время: {format_duration(elapsed)} ({elapsed:.1f}s)")
     log_print(f"media-monitor v{VERSION}")
     return 0
 
