@@ -70,6 +70,8 @@ class App:
         info.pack(fill="x", **pad)
         self.info_lbl = ttk.Label(info, text="")
         self.info_lbl.pack(anchor="w")
+        self.dates_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
+        self.dates_lbl.pack(anchor="w", pady=(2, 0))
 
         btns = ttk.Frame(root)
         btns.pack(fill="x", **pad)
@@ -80,9 +82,6 @@ class App:
         self.btn_stop = ttk.Button(btns, text="Стоп", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(0, 6))
 
-        ttk.Button(btns, text="Папка программы", command=self.open_app_dir).pack(
-            side="left", padx=(0, 6)
-        )
         ttk.Button(btns, text="Отчёты", command=self.open_reports).pack(
             side="left", padx=(0, 6)
         )
@@ -128,6 +127,19 @@ class App:
         self.info_lbl.configure(
             text=f"Папка: {root}   |   сайтов: {sites}   |   фраз: {words}"
         )
+        try:
+            settings_path = mm.resolve_settings_path(root)
+            mm.sync_settings_file(settings_path)
+            settings = mm.load_settings(settings_path)
+            eff_from, eff_to = mm.effective_article_date_range(
+                settings.article_date_not_older_than,
+                settings.article_date_not_later_than,
+                settings.article_date_last_days,
+            )
+            range_ru = mm.format_article_date_range_ru(eff_from, eff_to)
+            self.dates_lbl.configure(text=f"Статьи: {range_ru}")
+        except Exception:
+            self.dates_lbl.configure(text="Статьи: (не удалось прочитать settings.txt)")
 
     def append(self, text: str) -> None:
         self.gui_log.write_line(text if text.endswith("\n") else text + "\n")
@@ -205,9 +217,6 @@ class App:
         mm.request_cancel()
         self.status.configure(text="Остановка…")
         self.append("Запрошена остановка…\n")
-
-    def open_app_dir(self) -> None:
-        self._open_path(mm.app_dir())
 
     def open_reports(self) -> None:
         path = mm.app_dir() / "reports"
