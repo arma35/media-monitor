@@ -33,7 +33,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,6 +51,9 @@ DEFAULT_AUTH_TIMEOUT = 180
 _INSECURE_SSL_HOSTS: set[str] = set()
 _SSL_LOCK = threading.Lock()
 _PRINT_LOCK = threading.RLock()
+# Live HTTP sessions — closed on Stop to unblock workers stuck in network I/O.
+_ACTIVE_SESSIONS: set[requests.Session] = set()
+_SESSIONS_LOCK = threading.Lock()
 # Path to certifi + bundled Минцифры/extra CAs; set in run().
 _CA_BUNDLE: str | bool = True
 # When False, only progress/HIT/summary go to console (errors suppressed).
@@ -81,12 +84,44 @@ def set_progress_callback(callback: Callable[[dict], None] | None) -> None:
     _PROGRESS_CALLBACK = callback
 
 
+def register_session(session: requests.Session) -> None:
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.add(session)
+
+
+def unregister_session(session: requests.Session) -> None:
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.discard(session)
+
+
+def _close_all_sessions() -> int:
+    """Force-close live sessions so blocked GETs fail quickly on Stop."""
+    with _SESSIONS_LOCK:
+        sessions = list(_ACTIVE_SESSIONS)
+    closed = 0
+    for session in sessions:
+        try:
+            session.close()
+            closed += 1
+        except Exception:
+            pass
+    return closed
+
+
 def request_cancel() -> None:
     _CANCEL.set()
+    n = _close_all_sessions()
+    if n:
+        log_print(
+            f"Стоп: закрываю {n} сетевых соединений, "
+            "чтобы не ждать таймауты…"
+        )
 
 
 def clear_cancel() -> None:
     _CANCEL.clear()
+    with _SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.clear()
 
 
 def is_cancelled() -> bool:
@@ -1405,6 +1440,8 @@ def collect_urls_for_site(
         result.append(url)
 
     def add_links_from(page_url: str) -> None:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             return
         try:
@@ -1416,25 +1453,37 @@ def collect_urls_for_site(
                 add(link)
                 if full():
                     return
+        except CancelledError:
+            raise
         except AuthRequiredError as exc:
             detail_print(f"  [{site_label}] [skip auth] cannot expand {page_url}: {exc}")
         except requests.RequestException as exc:
+            if is_cancelled():
+                raise CancelledError() from exc
             detail_print(f"  [{site_label}] [warn] cannot expand {page_url}: {exc}")
 
     for url in seed_urls:
+        if is_cancelled():
+            raise CancelledError()
         add(url)
 
     origin = f"{urlparse(seed_urls[0]).scheme}://{urlparse(seed_urls[0]).netloc}"
     for phrase in phrases:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             break
         for search_url in site_search_urls(origin, phrase):
+            if is_cancelled():
+                raise CancelledError()
             if full():
                 break
             detail_print(f"  [{site_label}] search: {search_url}")
             add_links_from(search_url)
 
     for url in seed_urls:
+        if is_cancelled():
+            raise CancelledError()
         if full():
             break
         path = urlparse(url).path.rstrip("/")
@@ -1471,6 +1520,7 @@ def process_site(
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
+    register_session(session)
 
     result = SiteResult(origin=origin, label=label)
     try:
@@ -1486,6 +1536,8 @@ def process_site(
             # Host responds — not "unavailable", auth handled later per page.
             pass
         except requests.RequestException as exc:
+            if is_cancelled():
+                raise CancelledError() from exc
             result.errors += 1
             result.unavailable = True
             detail_print(f"  [{label}] [error] сайт недоступен: {exc}")
@@ -1516,6 +1568,8 @@ def process_site(
                     result.skipped_auth += 1
                     detail_print(f"  [{label}] [skip auth] {exc}")
                 except requests.RequestException as exc:
+                    if is_cancelled():
+                        raise CancelledError() from exc
                     result.errors += 1
                     detail_print(f"  [{label}] [error] {exc}")
 
@@ -1530,9 +1584,18 @@ def process_site(
     except CancelledError:
         result.fatal = "cancelled"
     except Exception as exc:  # noqa: BLE001 — site must not kill the pool
-        result.fatal = str(exc)
-        result.unavailable = True
-        detail_print(f"[{index}/{total}] FAIL {label} — {exc}")
+        if is_cancelled():
+            result.fatal = "cancelled"
+        else:
+            result.fatal = str(exc)
+            result.unavailable = True
+            detail_print(f"[{index}/{total}] FAIL {label} — {exc}")
+    finally:
+        unregister_session(session)
+        try:
+            session.close()
+        except Exception:
+            pass
 
     result.elapsed = time.monotonic() - started
     cancelled = result.fatal == "cancelled"

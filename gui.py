@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,8 @@ class App:
         self.last_report: Path | None = None
         self._progress_q: queue.Queue[dict] = queue.Queue()
         self._cached_workers = 0
+        self._run_started_mono: float | None = None
+        self._elapsed_job: str | None = None
 
         self._build()
         self._refresh_counts()
@@ -65,6 +68,9 @@ class App:
 
         self.status = ttk.Label(top, text="Готов к запуску", font=("Segoe UI", 11))
         self.status.pack(side="left")
+
+        self.elapsed_lbl = ttk.Label(top, text="Время: —", font=("Segoe UI", 11))
+        self.elapsed_lbl.pack(side="left", padx=(16, 0))
 
         self.version_lbl = ttk.Label(top, text=f"v{mm.VERSION}")
         self.version_lbl.pack(side="right")
@@ -118,14 +124,56 @@ class App:
         hint = ttk.Label(
             root,
             text=(
-                "Стоп = мягкая остановка: текущий запрос дожидается ответа, "
-                "новые страницы не берутся, Excel всё равно сохранится. "
-                "Консоль: --console"
+                "Стоп: сразу закрывает сеть и не ждёт длинные таймауты; "
+                "Excel всё равно сохранится. Консоль: --console"
             ),
             foreground="#555",
             wraplength=880,
         )
         hint.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _format_elapsed(self, seconds: float) -> str:
+        total = max(0, int(seconds))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}ч {m:02d}м {s:02d}с"
+        if m:
+            return f"{m}м {s:02d}с"
+        return f"{s}с"
+
+    def _tick_elapsed(self) -> None:
+        self._elapsed_job = None
+        if self._run_started_mono is None:
+            return
+        elapsed = time.monotonic() - self._run_started_mono
+        self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
+        if self.running:
+            self._elapsed_job = self.root.after(250, self._tick_elapsed)
+
+    def _start_elapsed(self) -> None:
+        self._run_started_mono = time.monotonic()
+        self.elapsed_lbl.configure(text="Время: 0с")
+        if self._elapsed_job is not None:
+            try:
+                self.root.after_cancel(self._elapsed_job)
+            except Exception:
+                pass
+        self._elapsed_job = self.root.after(250, self._tick_elapsed)
+
+    def _stop_elapsed(self, *, freeze: bool = True) -> None:
+        if self._elapsed_job is not None:
+            try:
+                self.root.after_cancel(self._elapsed_job)
+            except Exception:
+                pass
+            self._elapsed_job = None
+        if freeze and self._run_started_mono is not None:
+            elapsed = time.monotonic() - self._run_started_mono
+            self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
+        elif not freeze:
+            self.elapsed_lbl.configure(text="Время: —")
+            self._run_started_mono = None
 
     def _workers_from_settings(self, settings: mm.Settings, site_count: int) -> int:
         if site_count <= 0:
@@ -210,8 +258,8 @@ class App:
             self.progress_lbl.configure(
                 text=(
                     f"Остановка: готово {done}/{total} | находок {hits} | "
-                    f"ещё ждут ответ: {active} | параллельно {workers}. "
-                    "Excel сохранится."
+                    f"ещё выходят: {active} | параллельно {workers}. "
+                    "Сеть закрыта, Excel сохранится."
                 )
             )
         else:
@@ -239,6 +287,7 @@ class App:
         self.status.configure(text="Сканирование…")
         self.progress_lbl.configure(text="Запуск…")
         self.progress_bar["value"] = 0
+        self._start_elapsed()
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
@@ -292,6 +341,7 @@ class App:
         self.running = False
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        self._stop_elapsed(freeze=True)
         if mm.is_cancelled():
             self.status.configure(text="Остановлено — отчёт сохранён")
         elif code == 0:
@@ -306,8 +356,7 @@ class App:
         mm.request_cancel()
         self.status.configure(text="Остановка…")
         self.append(
-            "\nОстановка: новые страницы не берутся. "
-            "Сайты дождутся текущего ответа сети и выйдут. "
+            "\nОстановка: закрываю сеть, новые страницы не берутся. "
             "Excel сохранится с тем, что уже нашли.\n"
         )
 
