@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.2.2"
+VERSION = "3.3.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,6 +62,8 @@ _CA_BUNDLE: str | bool = True
 _LOG_VERBOSE = False
 # Optional UI/log sink: receives each printed line (including trailing \n).
 _LOG_CALLBACK: Callable[[str], None] | None = None
+# Optional detailed UI sink (full log tab) — always receives detail lines.
+_DETAIL_CALLBACK: Callable[[str], None] | None = None
 # Optional live progress sink for GUI status panel (dict snapshot).
 _PROGRESS_CALLBACK: Callable[[dict], None] | None = None
 # Cooperative cancel for GUI Stop button.
@@ -79,6 +81,12 @@ class CancelledError(Exception):
 def set_log_callback(callback: Callable[[str], None] | None) -> None:
     global _LOG_CALLBACK
     _LOG_CALLBACK = callback
+
+
+def set_detail_callback(callback: Callable[[str], None] | None) -> None:
+    """Full-detail UI sink (always on for the «Полный лог» tab)."""
+    global _DETAIL_CALLBACK
+    _DETAIL_CALLBACK = callback
 
 
 def set_progress_callback(callback: Callable[[dict], None] | None) -> None:
@@ -131,7 +139,7 @@ def is_cancelled() -> bool:
 
 
 def log_print(*args: object, **kwargs: object) -> None:
-    """Thread-safe print (whole line under one lock) + optional UI sink."""
+    """Thread-safe print (whole line under one lock) + optional UI sinks."""
     ensure_stdio()
     sep = str(kwargs.get("sep", " "))
     end = str(kwargs.get("end", "\n"))
@@ -147,12 +155,36 @@ def log_print(*args: object, **kwargs: object) -> None:
                 cb(line)
             except Exception:
                 pass
+        detail_cb = _DETAIL_CALLBACK
+        if detail_cb is not None:
+            try:
+                detail_cb(line)
+            except Exception:
+                pass
 
 
 def detail_print(*args: object, **kwargs: object) -> None:
-    """Extra diagnostics — only when log_verbose=1."""
-    if _LOG_VERBOSE:
-        log_print(*args, **kwargs)
+    """
+    Detailed progress (URL/search/errors).
+    Always goes to the GUI «Полный лог» tab when a detail callback is set.
+    Also printed to console/file when log_verbose=1.
+    """
+    ensure_stdio()
+    sep = str(kwargs.get("sep", " "))
+    end = str(kwargs.get("end", "\n"))
+    line = sep.join(str(a) for a in args) + end
+    with _PRINT_LOCK:
+        if _LOG_VERBOSE:
+            try:
+                print(*args, **kwargs)
+            except Exception:
+                pass
+        detail_cb = _DETAIL_CALLBACK
+        if detail_cb is not None:
+            try:
+                detail_cb(line)
+            except Exception:
+                pass
 
 
 def app_dir() -> Path:
@@ -1518,7 +1550,7 @@ def process_site(
         return result
 
     progress.site_start(label)
-    detail_print(f"старт сайта {label} ({index}/{total})")
+    detail_print(f"→ старт {label} ({index}/{total})")
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
@@ -1530,12 +1562,15 @@ def process_site(
             raise CancelledError()
 
         probe_url = seeds[0] if seeds else origin
+        detail_print(f"  [{label}] проверка доступности: {probe_url}")
         try:
             fetch_html(
                 probe_url, session, auth=auth, ssl_verify=settings.ssl_verify
             )
+            detail_print(f"  [{label}] сайт отвечает, собираю ссылки…")
         except AuthRequiredError:
             # Host responds — not "unavailable", auth handled later per page.
+            detail_print(f"  [{label}] отвечает (нужна авторизация), собираю ссылки…")
             pass
         except requests.RequestException as exc:
             if is_cancelled():
@@ -1566,6 +1601,10 @@ def process_site(
                     result.pages_scanned += 1
                     if page_hits:
                         result.hits.extend(page_hits)
+                        for hit in page_hits:
+                            detail_print(
+                                f"  [{label}] HIT «{hit.phrase}» {hit.url}"
+                            )
                 except AuthRequiredError as exc:
                     result.skipped_auth += 1
                     detail_print(f"  [{label}] [skip auth] {exc}")
@@ -1844,8 +1883,9 @@ def run(*, interactive_auth: bool = True) -> int:
         log_print("Подробный лог URL включён (log_verbose=1).")
     else:
         log_print(
-            "В логе — только итог по каждому сайту. "
-            "Живой прогресс смотрите в верхней панели."
+            "Вкладка «Статус» — итог по сайтам. "
+            "Вкладка «Полный лог» — что качается прямо сейчас. "
+            "Сводка также в верхней панели."
         )
 
     if interactive_auth:

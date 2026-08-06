@@ -19,13 +19,25 @@ import main as mm
 class GuiLog:
     """Queue lines from worker threads; drained on the Tk main thread."""
 
-    def __init__(self, root: tk.Tk, widget: scrolledtext.ScrolledText) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        widget: scrolledtext.ScrolledText,
+        *,
+        max_lines: int = 0,
+    ) -> None:
         self.root = root
         self.widget = widget
         self.q: queue.Queue[str] = queue.Queue()
+        self.max_lines = max_lines
 
     def write_line(self, line: str) -> None:
         self.q.put(line)
+
+    def clear(self) -> None:
+        self.widget.configure(state="normal")
+        self.widget.delete("1.0", "end")
+        self.widget.configure(state="disabled")
 
     def pump(self) -> None:
         try:
@@ -33,11 +45,15 @@ class GuiLog:
                 line = self.q.get_nowait()
                 self.widget.configure(state="normal")
                 self.widget.insert("end", line)
+                if self.max_lines > 0:
+                    last = int(float(self.widget.index("end-1c")))
+                    if last > self.max_lines:
+                        self.widget.delete("1.0", f"{last - self.max_lines}.0")
                 self.widget.see("end")
                 self.widget.configure(state="disabled")
         except queue.Empty:
             pass
-        self.root.after(100, self.pump)
+        self.root.after(80, self.pump)
 
 
 class App:
@@ -109,23 +125,43 @@ class App:
             btns, text="settings.txt", command=lambda: self.open_file("settings.txt")
         ).pack(side="left", padx=(0, 6))
 
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self.notebook = notebook
+
+        tab_status = ttk.Frame(notebook)
+        tab_full = ttk.Frame(notebook)
+        notebook.add(tab_status, text="Статус")
+        notebook.add(tab_full, text="Полный лог")
+
         self.log = scrolledtext.ScrolledText(
-            root,
+            tab_status,
             wrap="word",
-            height=24,
+            height=22,
             state="disabled",
             font=("Consolas", 10),
         )
-        self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.full_log = scrolledtext.ScrolledText(
+            tab_full,
+            wrap="word",
+            height=22,
+            state="disabled",
+            font=("Consolas", 9),
+        )
+        self.full_log.pack(fill="both", expand=True, padx=2, pady=2)
 
         self.gui_log = GuiLog(root, self.log)
         self.gui_log.pump()
+        self.gui_detail = GuiLog(root, self.full_log, max_lines=8000)
+        self.gui_detail.pump()
 
         hint = ttk.Label(
             root,
             text=(
-                "Стоп: сразу закрывает сеть и не ждёт длинные таймауты; "
-                "Excel всё равно сохранится. Консоль: --console"
+                "«Статус» — кратко по сайтам. «Полный лог» — что качается прямо сейчас. "
+                "Стоп закрывает сеть сразу; Excel сохранится. Консоль: --console"
             ),
             foreground="#555",
             wraplength=880,
@@ -288,11 +324,11 @@ class App:
         self.progress_lbl.configure(text="Запуск…")
         self.progress_bar["value"] = 0
         self._start_elapsed()
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+        self.gui_log.clear()
+        self.gui_detail.clear()
         mm.clear_cancel()
         mm.set_log_callback(self.gui_log.write_line)
+        mm.set_detail_callback(self.gui_detail.write_line)
         mm.set_progress_callback(self._on_progress)
 
         def work() -> None:
@@ -331,6 +367,7 @@ class App:
                     log_file.close()
                     mm.rotate_log_if_needed(mm.app_dir() / mm.LOG_NAME)
                 mm.set_log_callback(None)
+                mm.set_detail_callback(None)
                 mm.set_progress_callback(None)
                 self.root.after(0, lambda: self._on_done(code))
 
