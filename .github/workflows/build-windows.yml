@@ -34,20 +34,34 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content VERSION -Raw).Trim()
-          Write-Host "Building media-monitor v$version"
-          pyinstaller --noconfirm --clean --onefile --name media-monitor `
+          $exeName = "media-monitor-v$version"
+          Write-Host "Building $exeName (windowed GUI, no console)"
+          # --windowed / --noconsole: no black console alongside the Tk UI
+          pyinstaller --noconfirm --clean --onefile --windowed --name $exeName `
             --distpath dist `
             --workpath build `
+            --add-data "certs;certs" `
+            --hidden-import gui `
             main.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path dist\media-monitor.exe) {
+            Remove-Item -Force dist\media-monitor.exe
+          }
 
       - name: Prepare dist folder
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist\reports | Out-Null
           Copy-Item -Force sites.example.txt, words.example.txt, settings.example.txt, exclude.example.txt dist\
-          if (Test-Path ИНСТРУКЦИЯ.txt) { Copy-Item -Force ИНСТРУКЦИЯ.txt dist\ }
-          if (Test-Path ИНСТРУКЦИЯ.docx) { Copy-Item -Force ИНСТРУКЦИЯ.docx dist\ }
+          # ASCII copies avoid mojibake in zip on Windows runners
+          if (Test-Path ИНСТРУКЦИЯ.txt) {
+            Copy-Item -Force ИНСТРУКЦИЯ.txt dist\INSTRUCTION.txt
+            Copy-Item -Force ИНСТРУКЦИЯ.txt dist\ИНСТРУКЦИЯ.txt
+          }
+          if (Test-Path ИНСТРУКЦИЯ.docx) {
+            Copy-Item -Force ИНСТРУКЦИЯ.docx dist\INSTRUCTION.docx
+            Copy-Item -Force ИНСТРУКЦИЯ.docx dist\ИНСТРУКЦИЯ.docx
+          }
           if (Test-Path VERSION) { Copy-Item -Force VERSION dist\ }
 
           foreach ($name in @("sites", "words", "settings", "exclude")) {
