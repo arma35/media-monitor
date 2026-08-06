@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -198,8 +198,10 @@ class Settings:
     ssl_verify: bool
     # Parallel site workers: 0 = one thread per site (all at once).
     site_workers: int
-    # 1 = log every URL; 0 = only site start/end + hits.
+    # 1 = log every URL/errors; 0 = only status lines.
     log_verbose: bool
+    # If > 0, search only within last N days from today (overrides both date fields).
+    article_date_last_days: int
     # Comment unavailable sites in sites.txt with leading #.
     comment_unavailable_sites: bool
 
@@ -339,6 +341,11 @@ def load_settings(path: Path) -> Settings:
     if verbose_raw in {"1", "true", "yes", "on", "да"}:
         log_verbose = True
 
+    article_date_last_days = 0
+    recent_raw = raw.get("article_date_last_days", "")
+    if recent_raw:
+        article_date_last_days = max(0, int(recent_raw))
+
     comment_unavailable = True
     comment_raw = raw.get("comment_unavailable_sites", "1").strip().lower()
     if comment_raw in {"0", "false", "no", "off", "нет"}:
@@ -353,6 +360,7 @@ def load_settings(path: Path) -> Settings:
         ssl_verify=ssl_verify,
         site_workers=site_workers,
         log_verbose=log_verbose,
+        article_date_last_days=article_date_last_days,
         comment_unavailable_sites=comment_unavailable,
     )
 
@@ -403,7 +411,17 @@ def sync_settings_file(path: Path) -> None:
         "log_verbose",
         "0",
         [
-            "Подробный лог: 0 = только прогресс и HIT (ошибки скрыты), 1 = URL/SSL/ошибки.",
+            "Подробный лог: 0 = только понятный статус (без URL/HIT/ошибок), 1 = URL/SSL/ошибки.",
+        ],
+    )
+    ensure_settings_option(
+        path,
+        "article_date_last_days",
+        "0",
+        [
+            "За сколько последних дней от сегодня искать статьи.",
+            "0 = выключено (используются article_date_not_older_than/not_later_than).",
+            "Если > 0 — этот параметр перекрывает оба фильтра дат.",
         ],
     )
     ensure_settings_option(
@@ -1161,13 +1179,19 @@ def passes_date_filter(
     published: date | None,
     min_date: date | None,
     max_date: date | None,
+    recent_days: int = 0,
 ) -> bool:
     """
     Keep if min_date <= published <= max_date.
+    If recent_days > 0, use [today - recent_days; today] and ignore min/max args.
     Unknown publish date — always keep (include in report).
     """
     if published is None:
         return True
+    if recent_days > 0:
+        today = date.today()
+        lower = today.fromordinal(today.toordinal() - recent_days)
+        return lower <= published <= today
     if min_date is not None and published < min_date:
         return False
     if max_date is not None and published > max_date:
@@ -1217,6 +1241,7 @@ def scan_page(
         published,
         settings.article_date_not_older_than,
         settings.article_date_not_later_than,
+        settings.article_date_last_days,
     ):
         return []
 
@@ -1401,8 +1426,6 @@ def process_site(
                     )
                     result.pages_scanned += 1
                     if page_hits:
-                        for hit in page_hits:
-                            log_print(f"  HIT [{label}] «{hit.phrase}» {hit.url}")
                         result.hits.extend(page_hits)
                 except AuthRequiredError as exc:
                     result.skipped_auth += 1
@@ -1593,12 +1616,19 @@ def run(*, interactive_auth: bool = True) -> int:
     log_print(f"Settings: {settings_path.name}")
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
-    log_print(
-        "Filter dates: "
-        f"not older than {older.isoformat() if older else '(off)'}, "
-        f"not later than {later.isoformat()} "
-        "(unknown publish dates are kept)"
-    )
+    if settings.article_date_last_days > 0:
+        log_print(
+            "Filter dates: "
+            f"last {settings.article_date_last_days} day(s) from today "
+            "(overrides other date fields; unknown publish dates are kept)"
+        )
+    else:
+        log_print(
+            "Filter dates: "
+            f"not older than {older.isoformat() if older else '(off)'}, "
+            f"not later than {later.isoformat()} "
+            "(unknown publish dates are kept)"
+        )
     scan_limit = settings.max_scan_urls
     log_print(
         f"Scan limits: max_scan_urls="

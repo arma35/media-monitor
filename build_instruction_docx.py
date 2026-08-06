@@ -35,7 +35,7 @@ def main() -> None:
     doc = Document()
     title = doc.add_heading("Media Monitor — инструкция для пользователя", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    add_para(doc, "Версия программы: v3.0.1", bold=True)
+    add_para(doc, "Версия программы: v3.1.0", bold=True)
     add_para(
         doc,
         "Программа ищет заданные слова и фразы на указанных сайтах СМИ "
@@ -91,11 +91,12 @@ def main() -> None:
         [
             "article_date_not_later_than — дата ДО (включительно). Пусто = сегодня.",
             "article_date_not_older_than — дата НЕ СТАРШЕ. Пример 2026-01-01 — только с этой даты и новее. Пусто = без нижней границы.",
+            "article_date_last_days — за сколько последних дней от сегодня искать; если >0, перекрывает оба параметра дат.",
             "auth_timeout_seconds — сколько секунд ждать логин/пароль при старте.",
             "max_scan_urls — максимум страниц на один сайт. 0 = без лимита.",
             "max_expand_links — сколько ссылок брать с одной страницы списка/поиска.",
             "site_workers — сколько сайтов одновременно (0 = все сразу).",
-            "log_verbose — 0 только прогресс и HIT, 1 — URL и ошибки.",
+            "log_verbose — 0 только статус этапов, 1 — URL и ошибки.",
             "comment_unavailable_sites — 1 закомментировать недоступный сайт в sites.txt (#).",
             "ssl_verify — 1 проверять (в exe уже есть CA Минцифры и др.), 0 — не проверять.",
         ],
@@ -177,7 +178,7 @@ def main() -> None:
         ],
     )
 
-    add_para(doc, "Текущий релиз: v3.0.1", bold=True)
+    add_para(doc, "Текущий релиз: v3.1.0", bold=True)
     doc.save(OUT)
     print(f"Wrote {OUT}")
 
