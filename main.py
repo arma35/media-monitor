@@ -6,10 +6,12 @@ Configs and reports live next to the executable (USB-friendly).
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -35,7 +37,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.3.3"
+VERSION = "4.0.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -48,6 +50,7 @@ MAX_PAGE_CHARS = 500_000
 LOG_NAME = "media-monitor_log.txt"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_AUTH_TIMEOUT = 180
+CACHE_NAME = "scan_cache.sqlite"
 
 # Hosts that already failed cert verification this run — skip verify next time.
 _INSECURE_SSL_HOSTS: set[str] = set()
@@ -307,6 +310,8 @@ class Settings:
     article_date_last_days: int
     # Comment unavailable sites in sites.txt with leading #.
     comment_unavailable_sites: bool
+    # Skip URLs scanned within N days (same words.txt fingerprint). 0 = always rescan.
+    skip_seen_days: int
 
 
 @dataclass(frozen=True)
@@ -325,11 +330,127 @@ class SiteResult:
     hits: list[Hit] = field(default_factory=list)
     pages_collected: int = 0
     pages_scanned: int = 0
+    pages_skipped_cache: int = 0
     errors: int = 0
     skipped_auth: int = 0
     elapsed: float = 0.0
     fatal: str | None = None
     unavailable: bool = False
+
+
+def cache_url_key(url: str) -> str:
+    """Stable URL key for the scan cache (no fragment, no trailing slash)."""
+    return normalize_url(url).split("#", 1)[0].rstrip("/")
+
+
+def phrases_fingerprint(phrases: Iterable[str]) -> str:
+    """Short hash of the active keyword list — cache invalidates when words change."""
+    normalized = "\n".join(sorted(p.strip().lower() for p in phrases if p.strip()))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class ScanCache:
+    """SQLite cache of scanned article URLs (portable file next to the exe)."""
+
+    path: Path
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _conn: sqlite3.Connection | None = field(default=None, repr=False)
+
+    def open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=60)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scanned_pages (
+                url TEXT PRIMARY KEY,
+                scanned_at TEXT NOT NULL,
+                phrases_hash TEXT NOT NULL,
+                published_at TEXT,
+                had_hit INTEGER NOT NULL DEFAULT 0,
+                title TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scanned_pages_seen "
+            "ON scanned_pages (phrases_hash, scanned_at)"
+        )
+        conn.commit()
+        self._conn = conn
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+    def count(self) -> int:
+        with self._lock:
+            if self._conn is None:
+                return 0
+            row = self._conn.execute("SELECT COUNT(*) FROM scanned_pages").fetchone()
+            return int(row[0]) if row else 0
+
+    def should_skip(self, url: str, phrases_hash: str, skip_days: int) -> bool:
+        if skip_days <= 0 or self._conn is None or not phrases_hash:
+            return False
+        key = cache_url_key(url)
+        cutoff = (datetime.now() - timedelta(days=skip_days)).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM scanned_pages "
+                "WHERE url = ? AND phrases_hash = ? AND scanned_at >= ? "
+                "LIMIT 1",
+                (key, phrases_hash, cutoff),
+            ).fetchone()
+            return row is not None
+
+    def record(
+        self,
+        url: str,
+        phrases_hash: str,
+        *,
+        published: date | None,
+        had_hit: bool,
+        title: str = "",
+    ) -> None:
+        if self._conn is None or not phrases_hash:
+            return
+        key = cache_url_key(url)
+        now = datetime.now().isoformat(timespec="seconds")
+        published_str = published.isoformat() if published else ""
+        title_clean = (title or "")[:500]
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO scanned_pages
+                    (url, scanned_at, phrases_hash, published_at, had_hit, title)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    scanned_at = excluded.scanned_at,
+                    phrases_hash = excluded.phrases_hash,
+                    published_at = excluded.published_at,
+                    had_hit = excluded.had_hit,
+                    title = excluded.title
+                """,
+                (
+                    key,
+                    now,
+                    phrases_hash,
+                    published_str,
+                    1 if had_hit else 0,
+                    title_clean,
+                ),
+            )
+            self._conn.commit()
 
 
 @dataclass
@@ -540,6 +661,11 @@ def load_settings(path: Path) -> Settings:
     if comment_raw in {"0", "false", "no", "off", "нет"}:
         comment_unavailable = False
 
+    skip_seen_days = 0
+    skip_raw = raw.get("skip_seen_days", "")
+    if skip_raw:
+        skip_seen_days = max(0, int(skip_raw))
+
     return Settings(
         article_date_not_older_than=min_date,
         article_date_not_later_than=max_date,
@@ -551,6 +677,7 @@ def load_settings(path: Path) -> Settings:
         log_verbose=log_verbose,
         article_date_last_days=article_date_last_days,
         comment_unavailable_sites=comment_unavailable,
+        skip_seen_days=skip_seen_days,
     )
 
 
@@ -620,6 +747,17 @@ def sync_settings_file(path: Path) -> None:
         [
             "Если сайт полностью недоступен — закомментировать его строку в sites.txt (#).",
             "1 = да, 0 = нет. В Excel недоступные сайты всё равно пишутся в конце отчёта (красным).",
+        ],
+    )
+    ensure_settings_option(
+        path,
+        "skip_seen_days",
+        "30",
+        [
+            "Не сканировать повторно URL, уже проверенные за последние N дней",
+            "(файл scan_cache.sqlite рядом с программой).",
+            "0 = выкл. (каждый запуск качает всё заново).",
+            "При смене words.txt кэш для старых фраз не действует — страницы пересканируются.",
         ],
     )
 
@@ -1548,6 +1686,8 @@ def scan_page(
     settings: Settings,
     auth: tuple[str, str] | None,
     excluded: set[str] | None = None,
+    cache: ScanCache | None = None,
+    phrases_hash: str = "",
 ) -> list[Hit]:
     if excluded and is_excluded_url(url, excluded):
         return []
@@ -1557,6 +1697,8 @@ def scan_page(
 
     # Seeds may be categories; expanded company cards must not become report rows.
     if not is_probable_article_url(url) and not page_looks_like_article(soup, url):
+        if cache is not None:
+            cache.record(url, phrases_hash, published=None, had_hit=False, title="")
         return []
 
     title = extract_title(soup)
@@ -1569,6 +1711,10 @@ def scan_page(
         settings.article_date_not_later_than,
         settings.article_date_last_days,
     ):
+        if cache is not None:
+            cache.record(
+                url, phrases_hash, published=published, had_hit=False, title=title
+            )
         return []
 
     published_str = published.isoformat() if published else ""
@@ -1584,6 +1730,14 @@ def scan_page(
                     scanned_at=scanned_at,
                 )
             )
+    if cache is not None:
+        cache.record(
+            url,
+            phrases_hash,
+            published=published,
+            had_hit=bool(hits),
+            title=title,
+        )
     return hits
 
 
@@ -1713,6 +1867,8 @@ def process_site(
     excluded: set[str],
     scanned_at: datetime,
     progress: RunProgress,
+    cache: ScanCache | None = None,
+    phrases_hash: str = "",
 ) -> SiteResult:
     """One site = one worker; all HTTP for this site is sequential."""
     label = urlparse(origin).netloc or origin
@@ -1766,10 +1922,28 @@ def process_site(
             for i, url in enumerate(urls, start=1):
                 if is_cancelled():
                     raise CancelledError()
+                if (
+                    cache is not None
+                    and settings.skip_seen_days > 0
+                    and cache.should_skip(url, phrases_hash, settings.skip_seen_days)
+                ):
+                    result.pages_skipped_cache += 1
+                    detail_print(
+                        f"  [{label}] [{i}/{len(urls)}] [cache] уже смотрели: {url}"
+                    )
+                    continue
                 detail_print(f"  [{label}] [{i}/{len(urls)}] {url}")
                 try:
                     page_hits = scan_page(
-                        url, phrases, session, scanned_at, settings, auth, excluded
+                        url,
+                        phrases,
+                        session,
+                        scanned_at,
+                        settings,
+                        auth,
+                        excluded,
+                        cache=cache,
+                        phrases_hash=phrases_hash,
                     )
                     result.pages_scanned += 1
                     if page_hits:
@@ -1791,6 +1965,7 @@ def process_site(
             if (
                 not result.unavailable
                 and result.pages_scanned == 0
+                and result.pages_skipped_cache == 0
                 and result.errors > 0
                 and result.skipped_auth == 0
             ):
@@ -1821,17 +1996,24 @@ def process_site(
         cancelled=cancelled,
     )
     dur = format_duration(result.elapsed)
+    skip_bit = (
+        f", кэш-пропуск {result.pages_skipped_cache}"
+        if result.pages_skipped_cache
+        else ""
+    )
     if cancelled:
         log_print(
             f"[{done}/{total}] остановлен  {label} "
-            f"(успели {result.pages_scanned} стр., {len(result.hits)} находок, {dur})"
+            f"(успели {result.pages_scanned} стр.{skip_bit}, "
+            f"{len(result.hits)} находок, {dur})"
         )
     elif result.unavailable:
         log_print(f"[{done}/{total}] недоступен  {label} ({dur})")
     else:
         log_print(
             f"[{done}/{total}] готово  {label} — "
-            f"{result.pages_scanned} стр., {len(result.hits)} находок ({dur}) "
+            f"{result.pages_scanned} стр.{skip_bit}, "
+            f"{len(result.hits)} находок ({dur}) "
             f"| всего находок: {hit_total}"
         )
     return result
@@ -2041,13 +2223,41 @@ def run(*, interactive_auth: bool = True) -> int:
         + ("проверка вкл. (встроенные CA + Минцифры)" if settings.ssl_verify else "без проверки")
     )
 
+    cache_path = root / CACHE_NAME
+    phrases_hash = phrases_fingerprint(phrases) if phrases else ""
+    cache: ScanCache | None = None
+    if settings.skip_seen_days > 0:
+        cache = ScanCache(cache_path)
+        try:
+            cache.open()
+            log_print(
+                f"Кэш: {CACHE_NAME} ({cache.count()} стр.), "
+                f"не сканировать повторно {settings.skip_seen_days} дн. "
+                f"(fingerprint слов: {phrases_hash})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_print(f"WARNING: не удалось открыть кэш ({exc}) — работаю без пропуска.")
+            try:
+                cache.close()
+            except Exception:
+                pass
+            cache = None
+    else:
+        log_print(
+            f"Кэш: выкл. (skip_seen_days=0). Файл {CACHE_NAME} не используется."
+        )
+
     if not sites:
+        if cache is not None:
+            cache.close()
         log_print("ERROR: sites.txt is empty (no URLs).")
         elapsed = time.monotonic() - started_mono
         log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
         log_print(f"media-monitor v{VERSION}")
         return 1
     if not phrases:
+        if cache is not None:
+            cache.close()
         log_print("ERROR: words.txt is empty (no keywords/phrases).")
         elapsed = time.monotonic() - started_mono
         log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
@@ -2090,6 +2300,7 @@ def run(*, interactive_auth: bool = True) -> int:
     errors = 0
     skipped_auth = 0
     pages_total = 0
+    pages_skipped_cache = 0
     fatal_sites = 0
     unavailable: list[str] = []
     unavailable_hosts: set[str] = set()
@@ -2097,55 +2308,68 @@ def run(*, interactive_auth: bool = True) -> int:
     stopped_sites = 0
 
     log_print("Сканирование…")
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                process_site,
-                index,
-                total_sites,
-                origin,
-                seeds,
-                phrases,
-                settings,
-                auth,
-                excluded,
-                scanned_at,
-                progress,
-            ): origin
-            for index, (origin, seeds) in enumerate(site_groups, start=1)
-        }
-        for fut in as_completed(futures):
-            # Soft-cancel: mark flag for workers, cancel queued tasks,
-            # but ALWAYS collect results so Excel keeps found hits.
-            if is_cancelled():
-                cancelled = True
-                for pending in futures:
-                    pending.cancel()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    process_site,
+                    index,
+                    total_sites,
+                    origin,
+                    seeds,
+                    phrases,
+                    settings,
+                    auth,
+                    excluded,
+                    scanned_at,
+                    progress,
+                    cache,
+                    phrases_hash,
+                ): origin
+                for index, (origin, seeds) in enumerate(site_groups, start=1)
+            }
+            for fut in as_completed(futures):
+                # Soft-cancel: mark flag for workers, cancel queued tasks,
+                # but ALWAYS collect results so Excel keeps found hits.
+                if is_cancelled():
+                    cancelled = True
+                    for pending in futures:
+                        pending.cancel()
+                try:
+                    site_result = fut.result()
+                except FuturesCancelledError:
+                    stopped_sites += 1
+                    with progress._lock:
+                        progress.done += 1
+                        progress.cancelled_sites += 1
+                    progress._notify()
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    log_print(f"ERROR worker: {exc}")
+                    errors += 1
+                    continue
+                hits.extend(site_result.hits)
+                errors += site_result.errors
+                skipped_auth += site_result.skipped_auth
+                pages_total += site_result.pages_scanned
+                pages_skipped_cache += site_result.pages_skipped_cache
+                if site_result.fatal == "cancelled":
+                    stopped_sites += 1
+                elif site_result.fatal:
+                    fatal_sites += 1
+                    errors += 1
+                if site_result.unavailable:
+                    unavailable.append(site_result.origin)
+                    unavailable_hosts.add(site_host_key(site_result.origin))
+    finally:
+        if cache is not None:
             try:
-                site_result = fut.result()
-            except FuturesCancelledError:
-                stopped_sites += 1
-                with progress._lock:
-                    progress.done += 1
-                    progress.cancelled_sites += 1
-                progress._notify()
-                continue
-            except Exception as exc:  # noqa: BLE001
-                log_print(f"ERROR worker: {exc}")
-                errors += 1
-                continue
-            hits.extend(site_result.hits)
-            errors += site_result.errors
-            skipped_auth += site_result.skipped_auth
-            pages_total += site_result.pages_scanned
-            if site_result.fatal == "cancelled":
-                stopped_sites += 1
-            elif site_result.fatal:
-                fatal_sites += 1
-                errors += 1
-            if site_result.unavailable:
-                unavailable.append(site_result.origin)
-                unavailable_hosts.add(site_host_key(site_result.origin))
+                cache_count = cache.count()
+            except Exception:
+                cache_count = None
+            cache.close()
+            if cache_count is not None:
+                log_print(f"Кэш сохранён: {CACHE_NAME} ({cache_count} стр.).")
 
     if cancelled or is_cancelled():
         log_print()
@@ -2181,6 +2405,7 @@ def run(*, interactive_auth: bool = True) -> int:
     log_print(
         f"Итог: сайтов {total_sites}, страниц {pages_total}, "
         f"находок {len(hits)}, ошибок {errors}"
+        + (f", кэш-пропуск {pages_skipped_cache}" if pages_skipped_cache else "")
         + (f", недоступных {len(unavailable)}" if unavailable else "")
         + (f", закомментированных {len(commented_sites)}" if commented_sites else "")
         + (f", остановлено {stopped_sites}" if stopped_sites else "")
