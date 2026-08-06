@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.1.0"
+VERSION = "3.1.2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1175,6 +1175,35 @@ def phrase_present(text: str, phrase: str) -> bool:
     return True
 
 
+def effective_article_date_range(
+    min_date: date | None,
+    max_date: date,
+    recent_days: int = 0,
+    *,
+    today: date | None = None,
+) -> tuple[date | None, date]:
+    """
+    Compute the from/to window used by the article date filter.
+    If recent_days > 0 — [today - recent_days; today], ignoring min/max.
+    Otherwise — [min_date; max_date] (min_date may be None = no lower bound).
+    """
+    today = today or date.today()
+    if recent_days > 0:
+        lower = date.fromordinal(today.toordinal() - recent_days)
+        return lower, today
+    return min_date, max_date
+
+
+def format_article_date_range_ru(
+    min_date: date | None,
+    max_date: date,
+) -> str:
+    """Human-readable «с … по …» for UI/logs."""
+    if min_date is None:
+        return f"с (без нижней границы) по {max_date.isoformat()}"
+    return f"с {min_date.isoformat()} по {max_date.isoformat()}"
+
+
 def passes_date_filter(
     published: date | None,
     min_date: date | None,
@@ -1188,13 +1217,15 @@ def passes_date_filter(
     """
     if published is None:
         return True
-    if recent_days > 0:
-        today = date.today()
-        lower = today.fromordinal(today.toordinal() - recent_days)
-        return lower <= published <= today
-    if min_date is not None and published < min_date:
+    # max_date is always set by load_settings (defaults to today); keep Optional for callers.
+    eff_min, eff_max = effective_article_date_range(
+        min_date,
+        max_date if max_date is not None else date.today(),
+        recent_days,
+    )
+    if eff_min is not None and published < eff_min:
         return False
-    if max_date is not None and published > max_date:
+    if published > eff_max:
         return False
     return True
 
@@ -1616,17 +1647,21 @@ def run(*, interactive_auth: bool = True) -> int:
     log_print(f"Settings: {settings_path.name}")
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
+    eff_from, eff_to = effective_article_date_range(
+        older, later, settings.article_date_last_days
+    )
+    range_ru = format_article_date_range_ru(eff_from, eff_to)
     if settings.article_date_last_days > 0:
         log_print(
             "Filter dates: "
-            f"last {settings.article_date_last_days} day(s) from today "
-            "(overrides other date fields; unknown publish dates are kept)"
+            f"{range_ru} "
+            f"(last {settings.article_date_last_days} day(s); "
+            "overrides other date fields; unknown publish dates are kept)"
         )
     else:
         log_print(
             "Filter dates: "
-            f"not older than {older.isoformat() if older else '(off)'}, "
-            f"not later than {later.isoformat()} "
+            f"{range_ru} "
             "(unknown publish dates are kept)"
         )
     scan_limit = settings.max_scan_urls
