@@ -12,23 +12,27 @@ import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable, TextIO
+from typing import Callable, Iterable, TextIO
 from urllib.parse import quote, urljoin, urlparse
 
+import certifi
 import requests
 import urllib3
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "1.0.2"
+VERSION = "3.0.1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,10 +48,66 @@ DEFAULT_AUTH_TIMEOUT = 180
 
 # Hosts that already failed cert verification this run — skip verify next time.
 _INSECURE_SSL_HOSTS: set[str] = set()
+_SSL_LOCK = threading.Lock()
+_PRINT_LOCK = threading.RLock()
+# Path to certifi + bundled Минцифры/extra CAs; set in run().
+_CA_BUNDLE: str | bool = True
+# When False, only progress/HIT/summary go to console (errors suppressed).
+_LOG_VERBOSE = False
+# Optional UI/log sink: receives each printed line (including trailing \n).
+_LOG_CALLBACK: Callable[[str], None] | None = None
+# Cooperative cancel for GUI Stop button.
+_CANCEL = threading.Event()
 
 
 class AuthRequiredError(Exception):
     """Page requires authentication that was not provided or failed."""
+
+
+class CancelledError(Exception):
+    """Scan was cancelled by the user."""
+
+
+def set_log_callback(callback: Callable[[str], None] | None) -> None:
+    global _LOG_CALLBACK
+    _LOG_CALLBACK = callback
+
+
+def request_cancel() -> None:
+    _CANCEL.set()
+
+
+def clear_cancel() -> None:
+    _CANCEL.clear()
+
+
+def is_cancelled() -> bool:
+    return _CANCEL.is_set()
+
+
+def log_print(*args: object, **kwargs: object) -> None:
+    """Thread-safe print (whole line under one lock) + optional UI sink."""
+    ensure_stdio()
+    sep = str(kwargs.get("sep", " "))
+    end = str(kwargs.get("end", "\n"))
+    line = sep.join(str(a) for a in args) + end
+    with _PRINT_LOCK:
+        try:
+            print(*args, **kwargs)
+        except Exception:
+            pass
+        cb = _LOG_CALLBACK
+        if cb is not None:
+            try:
+                cb(line)
+            except Exception:
+                pass
+
+
+def detail_print(*args: object, **kwargs: object) -> None:
+    """Extra diagnostics — only when log_verbose=1."""
+    if _LOG_VERBOSE:
+        log_print(*args, **kwargs)
 
 
 def app_dir() -> Path:
@@ -57,22 +117,72 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def resource_dir() -> Path:
+    """Packaged resources (PyInstaller _MEIPASS) or project root in dev."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
+    return Path(__file__).resolve().parent
+
+
+def build_ca_bundle() -> str:
+    """certifi roots + certs/*.pem (Минцифры, intermediates) baked into the build."""
+    import tempfile
+
+    parts = [Path(certifi.where()).read_text(encoding="utf-8")]
+    certs_dir = resource_dir() / "certs"
+    extra = 0
+    if certs_dir.is_dir():
+        for pem in sorted(certs_dir.glob("*.pem")):
+            parts.append(pem.read_text(encoding="utf-8"))
+            extra += 1
+    out = Path(tempfile.gettempdir()) / "media-monitor-ca-bundle.pem"
+    out.write_text("\n".join(parts), encoding="utf-8")
+    detail_print(f"SSL CA bundle: certifi + {extra} extra CA(s)")
+    return str(out)
+
+
 class Tee:
     """Write the same text to console and an appendable log file."""
 
-    def __init__(self, *streams: TextIO) -> None:
-        self.streams = streams
+    def __init__(self, *streams: TextIO | None) -> None:
+        self.streams = tuple(s for s in streams if s is not None)
 
     def write(self, data: str) -> int:
-        for stream in self.streams:
-            stream.write(data)
-            stream.flush()
+        with _PRINT_LOCK:
+            for stream in self.streams:
+                try:
+                    stream.write(data)
+                    stream.flush()
+                except Exception:
+                    pass
         return len(data)
 
     def flush(self) -> None:
-        for stream in self.streams:
-            stream.flush()
+        with _PRINT_LOCK:
+            for stream in self.streams:
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
 
+
+class _NullWriter:
+    """Stand-in when the process has no console (windowed exe)."""
+
+    def write(self, data: str) -> int:
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+
+def ensure_stdio() -> None:
+    """Avoid crashes in --windowed builds where stdout/stderr are None."""
+    if sys.stdout is None:
+        sys.stdout = _NullWriter()  # type: ignore[assignment]
+    if sys.stderr is None:
+        sys.stderr = _NullWriter()  # type: ignore[assignment]
 
 @dataclass(frozen=True)
 class Settings:
@@ -81,11 +191,17 @@ class Settings:
     # Articles with publish date on/before this day ("дата ДО"). Empty = today.
     article_date_not_later_than: date
     auth_timeout_seconds: int
-    # 0 = no limit
+    # Max pages per site (0 = unlimited).
     max_scan_urls: int
     max_expand_links: int
     # True = verify TLS certs (with per-host fallback cache); False = never verify.
     ssl_verify: bool
+    # Parallel site workers: 0 = one thread per site (all at once).
+    site_workers: int
+    # 1 = log every URL; 0 = only site start/end + hits.
+    log_verbose: bool
+    # Comment unavailable sites in sites.txt with leading #.
+    comment_unavailable_sites: bool
 
 
 @dataclass(frozen=True)
@@ -95,6 +211,43 @@ class Hit:
     published_at: str
     title: str
     scanned_at: datetime
+
+
+@dataclass
+class SiteResult:
+    origin: str
+    label: str
+    hits: list[Hit] = field(default_factory=list)
+    pages_collected: int = 0
+    pages_scanned: int = 0
+    errors: int = 0
+    skipped_auth: int = 0
+    elapsed: float = 0.0
+    fatal: str | None = None
+    unavailable: bool = False
+
+
+@dataclass
+class RunProgress:
+    total_sites: int
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    done: int = 0
+    hits: int = 0
+    active: set[str] = field(default_factory=set)
+
+    def site_start(self, label: str) -> None:
+        with self._lock:
+            self.active.add(label)
+
+    def site_done(self, label: str, hit_count: int) -> tuple[int, int, str]:
+        with self._lock:
+            self.active.discard(label)
+            self.done += 1
+            self.hits += hit_count
+            running = ", ".join(sorted(self.active)[:5])
+            if len(self.active) > 5:
+                running += f"... (+{len(self.active) - 5})"
+            return self.done, self.hits, running or "-"
 
 
 def ensure_local_config(root: Path, name: str) -> Path:
@@ -176,6 +329,21 @@ def load_settings(path: Path) -> Settings:
     if ssl_raw in {"0", "false", "no", "off", "нет"}:
         ssl_verify = False
 
+    site_workers = 0
+    workers_raw = raw.get("site_workers", "")
+    if workers_raw:
+        site_workers = max(0, int(workers_raw))
+
+    log_verbose = False
+    verbose_raw = raw.get("log_verbose", "0").strip().lower()
+    if verbose_raw in {"1", "true", "yes", "on", "да"}:
+        log_verbose = True
+
+    comment_unavailable = True
+    comment_raw = raw.get("comment_unavailable_sites", "1").strip().lower()
+    if comment_raw in {"0", "false", "no", "off", "нет"}:
+        comment_unavailable = False
+
     return Settings(
         article_date_not_older_than=min_date,
         article_date_not_later_than=max_date,
@@ -183,7 +351,104 @@ def load_settings(path: Path) -> Settings:
         max_scan_urls=max_scan,
         max_expand_links=max_expand,
         ssl_verify=ssl_verify,
+        site_workers=site_workers,
+        log_verbose=log_verbose,
+        comment_unavailable_sites=comment_unavailable,
     )
+
+
+def ensure_settings_option(
+    path: Path,
+    key: str,
+    default: str,
+    comments: list[str],
+) -> bool:
+    """
+    If settings.txt has no key=… yet, append comments + key=default.
+    Never changes an existing value.
+    """
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8-sig")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.split("=", 1)[0].strip().lower() == key.lower():
+            return False
+    comment_block = "\n".join(f"# {c}" if c else "#" for c in comments)
+    addition = f"\n{comment_block}\n{key}={default}\n"
+    if text and not text.endswith("\n"):
+        addition = "\n" + addition
+    path.write_text(text + addition, encoding="utf-8")
+    log_print(f"settings.txt: добавлен параметр {key}={default}")
+    return True
+
+
+def sync_settings_file(path: Path) -> None:
+    """Append newly introduced settings keys without touching existing values."""
+    ensure_settings_option(
+        path,
+        "site_workers",
+        "0",
+        [
+            "Сколько сайтов сканировать одновременно (каждый сайт — свой поток).",
+            "Внутри сайта запросы всегда идут по одному.",
+            "0 = все сайты сразу (рекомендуется).",
+            "Например 8 — не больше 8 сайтов параллельно.",
+        ],
+    )
+    ensure_settings_option(
+        path,
+        "log_verbose",
+        "0",
+        [
+            "Подробный лог: 0 = только прогресс и HIT (ошибки скрыты), 1 = URL/SSL/ошибки.",
+        ],
+    )
+    ensure_settings_option(
+        path,
+        "comment_unavailable_sites",
+        "1",
+        [
+            "Если сайт полностью недоступен — закомментировать его строку в sites.txt (#).",
+            "1 = да, 0 = нет. В Excel недоступные сайты всё равно пишутся в конце отчёта (красным).",
+        ],
+    )
+
+
+def site_host_key(url: str) -> str:
+    """Normalize host for matching sites.txt lines (lowercase, without www.)."""
+    host = urlparse(normalize_url(url)).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def comment_unavailable_in_sites(sites_path: Path, unavailable_hosts: set[str]) -> int:
+    """Comment out matching active lines in sites.txt. Returns how many lines changed."""
+    if not unavailable_hosts or not sites_path.is_file():
+        return 0
+    text = sites_path.read_text(encoding="utf-8-sig")
+    lines = text.splitlines()
+    stamp = date.today().isoformat()
+    changed = 0
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        host = site_host_key(stripped)
+        if host in unavailable_hosts:
+            new_lines.append(f"# {stripped}  # недоступен {stamp}")
+            changed += 1
+        else:
+            new_lines.append(line)
+    if changed:
+        ending = "\n" if text.endswith("\n") or not text else ""
+        sites_path.write_text("\n".join(new_lines) + ending, encoding="utf-8")
+    return changed
 
 
 def normalize_url(url: str) -> str:
@@ -292,7 +557,7 @@ def fetch_html(
 ) -> str:
     host = urlparse(url).netloc.lower()
 
-    def _get(verify: bool, use_auth: bool) -> requests.Response:
+    def _get(verify: bool | str, use_auth: bool) -> requests.Response:
         return session.get(
             url,
             timeout=REQUEST_TIMEOUT,
@@ -301,14 +566,22 @@ def fetch_html(
             verify=verify,
         )
 
-    # After the first SSL failure for a host, never pay the double-request cost again.
-    verify = bool(ssl_verify) and host not in _INSECURE_SSL_HOSTS
+    with _SSL_LOCK:
+        insecure = host in _INSECURE_SSL_HOSTS
+    if ssl_verify and not insecure:
+        verify: bool | str = _CA_BUNDLE
+    else:
+        verify = False
     try:
         resp = _get(verify=verify, use_auth=False)
     except requests.exceptions.SSLError:
-        if host not in _INSECURE_SSL_HOSTS:
-            _INSECURE_SSL_HOSTS.add(host)
-            print(
+        first = False
+        with _SSL_LOCK:
+            if host not in _INSECURE_SSL_HOSTS:
+                _INSECURE_SSL_HOSTS.add(host)
+                first = True
+        if first:
+            detail_print(
                 f"  [ssl] у {host} битый сертификат — дальше для этого сайта "
                 "без проверки SSL (быстрее)."
             )
@@ -316,9 +589,15 @@ def fetch_html(
 
     if resp.status_code in (401, 403) and auth:
         try:
-            resp = _get(verify=verify and host not in _INSECURE_SSL_HOSTS, use_auth=True)
+            with _SSL_LOCK:
+                insecure = host in _INSECURE_SSL_HOSTS
+            auth_verify: bool | str = (
+                _CA_BUNDLE if ssl_verify and not insecure else False
+            )
+            resp = _get(verify=auth_verify, use_auth=True)
         except requests.exceptions.SSLError:
-            _INSECURE_SSL_HOSTS.add(host)
+            with _SSL_LOCK:
+                _INSECURE_SSL_HOSTS.add(host)
             resp = _get(verify=False, use_auth=True)
     if resp.status_code in (401, 403):
         raise AuthRequiredError(f"HTTP {resp.status_code} auth required/failed")
@@ -824,16 +1103,58 @@ def extract_page(html: str, base_url: str) -> tuple[str, date | None, str, list[
     return title, published, text, links
 
 
+def parse_search_line(line: str) -> tuple[str, str]:
+    """
+    words.txt line → (mode, value).
+
+    mode "phrase": exact phrase (line in "..." or «...»);
+    mode "words": all tokens must appear as whole words, any order.
+    """
+    raw = normalize_spaces(line)
+    if len(raw) >= 2:
+        pairs = (
+            ('"', '"'),
+            ("'", "'"),
+            ("«", "»"),
+            ("“", "”"),
+            ("„", "“"),
+        )
+        for left, right in pairs:
+            if raw.startswith(left) and raw.endswith(right):
+                return "phrase", normalize_spaces(raw[len(left) : -len(right)])
+    return "words", raw
+
+
+def query_for_site_search(line: str) -> str:
+    """Text to send to on-site search (without surrounding quotes)."""
+    _mode, value = parse_search_line(line)
+    return value
+
+
 def phrase_present(text: str, phrase: str) -> bool:
     """
-    Exact phrase match (case-insensitive), allowing flexible whitespace.
-    One line in words.txt = one phrase, e.g. "audi выпустили новую А6".
+    Match rules for one words.txt line:
+    - "карта Виза принимается в городе" — exact phrase (order fixed);
+    - тройка карта принимается — all words present as whole words, any order.
+    Case-insensitive; whitespace normalized.
     """
-    needle = normalize_spaces(phrase).casefold()
     haystack = normalize_spaces(text).casefold()
-    if not needle:
+    mode, value = parse_search_line(phrase)
+    if not value:
         return False
-    return needle in haystack
+    needle = value.casefold()
+
+    if mode == "phrase":
+        return needle in haystack
+
+    tokens = needle.split()
+    if not tokens:
+        return False
+    for token in tokens:
+        # Whole-word match (Latin + Cyrillic via Unicode \w).
+        if not re.search(rf"(?<!\w){re.escape(token)}(?!\w)", haystack):
+            return False
+    return True
 
 
 def passes_date_filter(
@@ -917,7 +1238,7 @@ def scan_page(
 
 def site_search_urls(origin: str, phrase: str) -> list[str]:
     """Common on-site search endpoints (helps find older articles not on homepage)."""
-    q = quote(phrase)
+    q = quote(query_for_site_search(phrase))
     base = origin.rstrip("/")
     return [
         # Yii/media sites (amurmedia.ru etc.)
@@ -929,22 +1250,40 @@ def site_search_urls(origin: str, phrase: str) -> list[str]:
     ]
 
 
-def collect_urls_to_scan(
-    seed_urls: Iterable[str],
+def group_seeds_by_origin(seed_urls: Iterable[str]) -> list[tuple[str, list[str]]]:
+    """Group seed URLs by origin; preserve first-seen order of sites."""
+    order: list[str] = []
+    groups: dict[str, list[str]] = {}
+    for seed in seed_urls:
+        url = normalize_url(seed)
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in groups:
+            groups[origin] = []
+            order.append(origin)
+        if url not in groups[origin]:
+            groups[origin].append(url)
+    return [(origin, groups[origin]) for origin in order]
+
+
+def collect_urls_for_site(
+    seed_urls: list[str],
     phrases: list[str],
     session: requests.Session,
     auth: tuple[str, str] | None,
     settings: Settings,
+    site_label: str,
 ) -> list[str]:
     """
-    Build scan list from seeds:
+    Build scan list for one site (sequential requests):
     1) seed URLs
-    2) site search for each phrase (priority — finds older articles)
+    2) site search for each phrase
     3) article links from listing/home pages
+    max_scan_urls applies per site.
     """
     result: list[str] = []
     seen: set[str] = set()
-    limit = settings.max_scan_urls  # 0 = unlimited
+    limit = settings.max_scan_urls  # 0 = unlimited (per site)
     expand_cap = settings.max_expand_links
 
     def full() -> bool:
@@ -969,38 +1308,24 @@ def collect_urls_to_scan(
                 if full():
                     return
         except AuthRequiredError as exc:
-            print(f"  [skip auth] cannot expand {page_url}: {exc}")
+            detail_print(f"  [{site_label}] [skip auth] cannot expand {page_url}: {exc}")
         except requests.RequestException as exc:
-            print(f"  [warn] cannot expand {page_url}: {exc}")
+            detail_print(f"  [{site_label}] [warn] cannot expand {page_url}: {exc}")
 
-    seeds_norm: list[str] = []
-    origins: list[str] = []
-    seen_origins: set[str] = set()
-    for seed in seed_urls:
-        url = normalize_url(seed)
-        seeds_norm.append(url)
+    for url in seed_urls:
         add(url)
-        parsed = urlparse(url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        if origin not in seen_origins:
-            seen_origins.add(origin)
-            origins.append(origin)
 
-    # Priority: on-site search by keywords (before homepage flood fills the queue)
-    for origin in origins:
+    origin = f"{urlparse(seed_urls[0]).scheme}://{urlparse(seed_urls[0]).netloc}"
+    for phrase in phrases:
         if full():
             break
-        for phrase in phrases:
+        for search_url in site_search_urls(origin, phrase):
             if full():
                 break
-            for search_url in site_search_urls(origin, phrase):
-                if full():
-                    break
-                print(f"  search: {search_url}")
-                add_links_from(search_url)
+            detail_print(f"  [{site_label}] search: {search_url}")
+            add_links_from(search_url)
 
-    # Then expand seed listing/home pages
-    for url in seeds_norm:
+    for url in seed_urls:
         if full():
             break
         path = urlparse(url).path.rstrip("/")
@@ -1008,7 +1333,115 @@ def collect_urls_to_scan(
             add_links_from(url)
 
     if limit > 0 and len(result) >= limit:
-        print(f"  [limit] reached max_scan_urls={limit}")
+        detail_print(f"  [{site_label}] [limit] max_scan_urls={limit} (на сайт)")
+    return result
+
+
+def process_site(
+    index: int,
+    total: int,
+    origin: str,
+    seeds: list[str],
+    phrases: list[str],
+    settings: Settings,
+    auth: tuple[str, str] | None,
+    excluded: set[str],
+    scanned_at: datetime,
+    progress: RunProgress,
+) -> SiteResult:
+    """One site = one worker; all HTTP for this site is sequential."""
+    label = urlparse(origin).netloc or origin
+    started = time.monotonic()
+    if is_cancelled():
+        result = SiteResult(origin=origin, label=label, fatal="cancelled")
+        return result
+
+    progress.site_start(label)
+    log_print(f"[{index}/{total}] >> {label}")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
+
+    result = SiteResult(origin=origin, label=label)
+    try:
+        if is_cancelled():
+            raise CancelledError()
+
+        probe_url = seeds[0] if seeds else origin
+        try:
+            fetch_html(
+                probe_url, session, auth=auth, ssl_verify=settings.ssl_verify
+            )
+        except AuthRequiredError:
+            # Host responds — not "unavailable", auth handled later per page.
+            pass
+        except requests.RequestException as exc:
+            result.errors += 1
+            result.unavailable = True
+            detail_print(f"  [{label}] [error] сайт недоступен: {exc}")
+
+        if not result.unavailable:
+            if is_cancelled():
+                raise CancelledError()
+            urls = collect_urls_for_site(
+                seeds, phrases, session, auth, settings, label
+            )
+            if excluded:
+                urls = [u for u in urls if not is_excluded_url(u, excluded)]
+            result.pages_collected = len(urls)
+            log_print(f"  [{label}] к скану {len(urls)} стр.")
+
+            for i, url in enumerate(urls, start=1):
+                if is_cancelled():
+                    raise CancelledError()
+                detail_print(f"  [{label}] [{i}/{len(urls)}] {url}")
+                try:
+                    page_hits = scan_page(
+                        url, phrases, session, scanned_at, settings, auth, excluded
+                    )
+                    result.pages_scanned += 1
+                    if page_hits:
+                        for hit in page_hits:
+                            log_print(f"  HIT [{label}] «{hit.phrase}» {hit.url}")
+                        result.hits.extend(page_hits)
+                except AuthRequiredError as exc:
+                    result.skipped_auth += 1
+                    detail_print(f"  [{label}] [skip auth] {exc}")
+                except requests.RequestException as exc:
+                    result.errors += 1
+                    detail_print(f"  [{label}] [error] {exc}")
+
+            # All collected pages failed to load (and none succeeded).
+            if (
+                not result.unavailable
+                and result.pages_scanned == 0
+                and result.errors > 0
+                and result.skipped_auth == 0
+            ):
+                result.unavailable = True
+    except CancelledError:
+        result.fatal = "cancelled"
+        log_print(f"[{index}/{total}] стоп {label}")
+    except Exception as exc:  # noqa: BLE001 — site must not kill the pool
+        result.fatal = str(exc)
+        result.unavailable = True
+        detail_print(f"[{index}/{total}] FAIL {label} — {exc}")
+
+    result.elapsed = time.monotonic() - started
+    done, hit_total, running = progress.site_done(label, len(result.hits))
+    if result.fatal == "cancelled":
+        pass
+    elif result.unavailable:
+        log_print(
+            f"[{done}/{total}] недоступен {label} "
+            f"({format_duration(result.elapsed)}) | HIT {hit_total}"
+        )
+    else:
+        log_print(
+            f"[{done}/{total}] {label} — {result.pages_scanned} стр., "
+            f"{len(result.hits)} HIT, {format_duration(result.elapsed)} "
+            f"| всего HIT {hit_total} | в работе: {running}"
+        )
     return result
 
 
@@ -1056,6 +1489,7 @@ def write_report(
     reports_dir: Path,
     generated_at: datetime,
     duration_seconds: float,
+    unavailable_sites: list[str] | None = None,
 ) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = generated_at.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1098,11 +1532,24 @@ def write_report(
             )
         )
 
-    for row in ws.iter_rows(min_row=2, max_col=2, max_row=ws.max_row):
-        cell = row[1]
-        if cell.value:
-            cell.hyperlink = str(cell.value)
-            cell.style = "Hyperlink"
+    hit_last_row = ws.max_row
+    if hit_last_row >= 2:
+        for row in ws.iter_rows(min_row=2, max_col=2, max_row=hit_last_row):
+            cell = row[1]
+            if cell.value and str(cell.value).startswith("http"):
+                cell.hyperlink = str(cell.value)
+                cell.style = "Hyperlink"
+
+    red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+    for site in unavailable_sites or []:
+        ws.append((site, "недоступен", "", "", "", "", ""))
+        row_idx = ws.max_row
+        for col in (1, 2):
+            cell = ws.cell(row=row_idx, column=col)
+            cell.fill = red_fill
+            cell.font = Font(bold=True, color="FFFFFF")
+        if str(site).startswith("http"):
+            ws.cell(row=row_idx, column=1).hyperlink = str(site)
 
     widths = (36, 70, 20, 50, 22, 14, 22)
     for idx, width in enumerate(widths, start=1):
@@ -1112,112 +1559,177 @@ def write_report(
     return out_path
 
 
-def run() -> int:
+def run(*, interactive_auth: bool = True) -> int:
     root = app_dir()
     reports_dir = root / "reports"
     started_mono = time.monotonic()
+    clear_cancel()
 
-    print(f"media-monitor v{VERSION}")
-    print(f"Working directory: {root}")
-    _INSECURE_SSL_HOSTS.clear()
+    log_print(f"media-monitor v{VERSION}")
+    log_print(f"Working directory: {root}")
+    with _SSL_LOCK:
+        _INSECURE_SSL_HOSTS.clear()
 
     try:
         sites_path = ensure_local_config(root, "sites.txt")
         words_path = ensure_local_config(root, "words.txt")
         exclude_path = ensure_local_config(root, "exclude.txt")
         settings_path = resolve_settings_path(root)
+        sync_settings_file(settings_path)
         sites = load_lines(sites_path)
         phrases = load_lines(words_path)
         excluded = load_exclude_urls(exclude_path)
         settings = load_settings(settings_path)
     except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: {exc}")
+        log_print(f"ERROR: {exc}")
         elapsed = time.monotonic() - started_mono
-        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
-        print(f"media-monitor v{VERSION}")
+        log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        log_print(f"media-monitor v{VERSION}")
         return 1
 
-    print(f"Sites: {sites_path.name}")
-    print(f"Words: {words_path.name}")
-    print(f"Exclude: {exclude_path.name} ({len(excluded)} URL(s))")
-    print(f"Settings: {settings_path.name}")
+    log_print(f"Sites: {sites_path.name}")
+    log_print(f"Words: {words_path.name}")
+    log_print(f"Exclude: {exclude_path.name} ({len(excluded)} URL(s))")
+    log_print(f"Settings: {settings_path.name}")
     older = settings.article_date_not_older_than
     later = settings.article_date_not_later_than
-    print(
+    log_print(
         "Filter dates: "
         f"not older than {older.isoformat() if older else '(off)'}, "
         f"not later than {later.isoformat()} "
         "(unknown publish dates are kept)"
     )
     scan_limit = settings.max_scan_urls
-    print(
+    log_print(
         f"Scan limits: max_scan_urls="
-        f"{'unlimited' if scan_limit == 0 else scan_limit}, "
+        f"{'unlimited' if scan_limit == 0 else scan_limit} (на сайт), "
         f"max_expand_links={settings.max_expand_links}"
     )
-    print(f"SSL verify: {'on' if settings.ssl_verify else 'off (быстрее на госсайтах)'}")
+    log_print(
+        "SSL verify: "
+        + ("on (встроенные CA + Минцифры)" if settings.ssl_verify else "off (без проверки)")
+    )
 
     if not sites:
-        print("ERROR: sites.txt is empty (no URLs).")
+        log_print("ERROR: sites.txt is empty (no URLs).")
         elapsed = time.monotonic() - started_mono
-        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
-        print(f"media-monitor v{VERSION}")
+        log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        log_print(f"media-monitor v{VERSION}")
         return 1
     if not phrases:
-        print("ERROR: words.txt is empty (no keywords/phrases).")
+        log_print("ERROR: words.txt is empty (no keywords/phrases).")
         elapsed = time.monotonic() - started_mono
-        print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
-        print(f"media-monitor v{VERSION}")
+        log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+        log_print(f"media-monitor v{VERSION}")
         return 1
 
-    print(f"Loaded {len(sites)} site(s), {len(phrases)} phrase(s).")
-    auth = prompt_credentials(settings.auth_timeout_seconds)
+    site_groups = group_seeds_by_origin(sites)
+    total_sites = len(site_groups)
+    workers = settings.site_workers if settings.site_workers > 0 else total_sites
+    workers = max(1, min(workers, total_sites))
+
+    log_print(
+        f"Loaded {total_sites} site(s), {len(phrases)} phrase(s). "
+        f"Parallel: {workers} worker(s) "
+        f"(внутри сайта — последовательно)."
+    )
+    if settings.log_verbose:
+        log_print("log_verbose=1 — подробный лог URL.")
+
+    if interactive_auth:
+        auth = prompt_credentials(settings.auth_timeout_seconds)
+    else:
+        auth = None
+        log_print("Авторизация: пропуск (GUI).")
 
     scanned_at = datetime.now()
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"})
+    global _CA_BUNDLE, _LOG_VERBOSE
+    _LOG_VERBOSE = settings.log_verbose
+    _CA_BUNDLE = build_ca_bundle() if settings.ssl_verify else False
 
-    print("Collecting pages…")
-    urls = collect_urls_to_scan(sites, phrases, session, auth, settings)
-    if excluded:
-        before = len(urls)
-        urls = [u for u in urls if not is_excluded_url(u, excluded)]
-        skipped = before - len(urls)
-        if skipped:
-            print(f"Excluded from scan by exclude.txt: {skipped}")
-    print(f"Will scan {len(urls)} page(s).")
-
+    progress = RunProgress(total_sites=total_sites)
     hits: list[Hit] = []
     errors = 0
     skipped_auth = 0
-    for i, url in enumerate(urls, start=1):
-        print(f"[{i}/{len(urls)}] {url}")
-        try:
-            page_hits = scan_page(
-                url, phrases, session, scanned_at, settings, auth, excluded
-            )
-            if page_hits:
-                print(f"  → {len(page_hits)} hit(s)")
-                hits.extend(page_hits)
-        except AuthRequiredError as exc:
-            skipped_auth += 1
-            print(f"  [skip auth] {exc}")
-        except requests.RequestException as exc:
-            errors += 1
-            print(f"  [error] {exc}")
+    pages_total = 0
+    fatal_sites = 0
+    unavailable: list[str] = []
+    unavailable_hosts: set[str] = set()
+    cancelled = False
 
+    log_print("Scanning sites...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                process_site,
+                index,
+                total_sites,
+                origin,
+                seeds,
+                phrases,
+                settings,
+                auth,
+                excluded,
+                scanned_at,
+                progress,
+            ): origin
+            for index, (origin, seeds) in enumerate(site_groups, start=1)
+        }
+        for fut in as_completed(futures):
+            if is_cancelled():
+                cancelled = True
+                for pending in futures:
+                    pending.cancel()
+                break
+            try:
+                site_result = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                log_print(f"ERROR worker: {exc}")
+                errors += 1
+                continue
+            hits.extend(site_result.hits)
+            errors += site_result.errors
+            skipped_auth += site_result.skipped_auth
+            pages_total += site_result.pages_scanned
+            if site_result.fatal and site_result.fatal != "cancelled":
+                fatal_sites += 1
+                errors += 1
+            if site_result.unavailable:
+                unavailable.append(site_result.origin)
+                unavailable_hosts.add(site_host_key(site_result.origin))
+
+    if cancelled or is_cancelled():
+        log_print("Остановка по запросу пользователя…")
+
+    if unavailable and settings.comment_unavailable_sites:
+        n = comment_unavailable_in_sites(sites_path, unavailable_hosts)
+        if n:
+            log_print(
+                f"sites.txt: закомментировано недоступных строк: {n} "
+                f"({', '.join(sorted(unavailable_hosts))})"
+            )
+
+    # Curator: one Excel write after all workers finish.
     report_path = write_report(
-        hits, reports_dir, datetime.now(), time.monotonic() - started_mono
+        hits,
+        reports_dir,
+        datetime.now(),
+        time.monotonic() - started_mono,
+        unavailable_sites=unavailable,
     )
     elapsed = time.monotonic() - started_mono
-    print()
-    print(
-        f"Done. Hits: {len(hits)}. Errors: {errors}. "
+    log_print()
+    log_print(
+        f"Done. Sites: {total_sites}. Pages: {pages_total}. "
+        f"Hits: {len(hits)}. Errors: {errors}. "
         f"Skipped (auth): {skipped_auth}."
+        + (f" Unavailable: {len(unavailable)}." if unavailable else "")
+        + (f" Fatal sites: {fatal_sites}." if fatal_sites else "")
+        + (" Cancelled." if cancelled or is_cancelled() else "")
     )
-    print(f"Report: {report_path}")
-    print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
-    print(f"media-monitor v{VERSION}")
+    log_print(f"Report: {report_path}")
+    log_print(f"Elapsed: {format_duration(elapsed)} ({elapsed:.1f}s)")
+    log_print(f"media-monitor v{VERSION}")
     return 0
 
 
@@ -1228,7 +1740,19 @@ def wait_for_enter() -> None:
         pass
 
 
-def main() -> int:
+def console_main() -> int:
+    """CLI mode (also: media-monitor-vX.exe --console)."""
+    if getattr(sys, "frozen", False) and sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.AllocConsole()
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     root = app_dir()
     log_path = root / LOG_NAME
     rotate_log_if_needed(log_path)
@@ -1242,7 +1766,7 @@ def main() -> int:
         log_file.flush()
         sys.stdout = Tee(original_stdout, log_file)  # type: ignore[assignment]
         sys.stderr = Tee(original_stderr, log_file)  # type: ignore[assignment]
-        code = run()
+        code = run(interactive_auth=True)
         return code
     finally:
         sys.stdout = original_stdout
@@ -1251,9 +1775,17 @@ def main() -> int:
         log_file.write(f"===== media-monitor v{VERSION} end {ended} =====\n")
         log_file.close()
         rotate_log_if_needed(log_path)
-        # Always pause in the Windows exe so the console stays readable.
         if getattr(sys, "frozen", False):
             wait_for_enter()
+
+
+def main() -> int:
+    ensure_stdio()
+    if "--console" in sys.argv:
+        return console_main()
+    from gui import run_gui
+
+    return run_gui()
 
 
 if __name__ == "__main__":

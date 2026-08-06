@@ -21,11 +21,17 @@ if exist "VERSION" (
 
 echo.
 echo Building media-monitor v%APP_VERSION% ...
-pyinstaller --noconfirm --clean --onefile --name media-monitor ^
+set "EXE_NAME=media-monitor-v%APP_VERSION%"
+pyinstaller --noconfirm --clean --onefile --windowed --name "%EXE_NAME%" ^
   --distpath dist ^
   --workpath build ^
+  --add-data "certs;certs" ^
+  --hidden-import gui ^
   main.py
 if errorlevel 1 exit /b 1
+
+REM Drop unversioned copy if an older build left it behind.
+if exist "dist\media-monitor.exe" del /Q "dist\media-monitor.exe" >nul 2>nul
 
 echo.
 echo Building user instruction DOCX...
@@ -82,9 +88,9 @@ if exist "dist\setting.txt" (
 echo.
 echo ============================================
 echo  Build OK: media-monitor v%APP_VERSION%
-echo  Output: dist\media-monitor.exe
+echo  Output: dist\%EXE_NAME%.exe
 echo ============================================
-echo   media-monitor.exe
+echo   %EXE_NAME%.exe
 echo   settings.example.txt  ^(образец, обновляется^)
 echo   settings.txt / sites.txt / words.txt / exclude.txt  ^(ваши, не затираются^)
 echo   ИНСТРУКЦИЯ.docx / ИНСТРУКЦИЯ.txt
