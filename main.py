@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.3.2"
+VERSION = "3.3.3"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1123,14 +1123,37 @@ def extract_date_from_url(url: str) -> date | None:
     return None
 
 
+def _in_junk_date_context(el) -> bool:
+    """True if element sits in ticker/sidebar/nav chrome (not the article date)."""
+    junk = re.compile(
+        r"(news-ticker|ticker|sidebar|widget|menu|nav|footer|header|share|social|"
+        r"related|popular|latest|recom|banner|advert|rekla|breadcrumb|"
+        r"top-news|other-news|lenta|feed__item)",
+        re.I,
+    )
+    cur = el
+    for _ in range(10):
+        if cur is None or not hasattr(cur, "get"):
+            break
+        classes = " ".join(cur.get("class") or [])
+        tid = str(cur.get("id") or "")
+        name = str(getattr(cur, "name", "") or "")
+        if junk.search(f"{classes} {tid} {name}"):
+            return True
+        cur = getattr(cur, "parent", None)
+    return False
+
+
 def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
     """
-    Pull a publish date from visible page chrome.
-    Prefer article-specific blocks (e.g. dostup1 .subtitle__date) over feed
-    widgets that often say only «сегодня, 18:27».
+    Pull publish date from article chrome — never from news tickers / sidebars.
+    Examples: dostup1 `.subtitle__date`, vestniksr `.bi_date_pub time`.
     """
     preferred = (
+        ".bi_date_pub",
+        ".bi_date_pub time",
         ".subtitle__date",
+        ".info_bar time",
         ".article-date",
         ".article__date",
         ".news-date",
@@ -1141,18 +1164,12 @@ def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
         ".b-article__date",
         ".post-date",
         ".entry-date",
-        "time[datetime]",
         "[itemprop='datePublished']",
         "[class*='subtitle__date']",
         "[class*='article__date']",
         "[class*='article-date']",
+        "[class*='date_pub']",
         "[class*='publish']",
-    )
-    broad = (
-        "time",
-        ".date",
-        "[class*='date']",
-        "[class*='Date']",
     )
 
     def _raw_from(el) -> str:
@@ -1163,21 +1180,11 @@ def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
             or ""
         ).strip()
 
-    # 1) Specific article date blocks — absolute dates first.
+    # 1) Article-specific blocks (skip ticker/sidebar ancestors).
     for sel in preferred:
-        for el in soup.select(sel)[:15]:
-            raw = _raw_from(el)
-            if not raw:
+        for el in soup.select(sel)[:20]:
+            if _in_junk_date_context(el):
                 continue
-            if _looks_like_relative_date_text(raw):
-                continue
-            parsed = parse_date_value(raw)
-            if parsed:
-                return parsed
-
-    # 2) Broad selectors — only absolute dates (skip feed «сегодня»).
-    for sel in broad:
-        for el in soup.select(sel)[:40]:
             raw = _raw_from(el)
             if not raw or _looks_like_relative_date_text(raw):
                 continue
@@ -1185,17 +1192,28 @@ def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
             if parsed:
                 return parsed
 
-    # 3) Relative date only from preferred article chrome.
-    for sel in preferred:
-        for el in soup.select(sel)[:15]:
-            raw = _raw_from(el)
-            if not raw:
-                continue
-            parsed = parse_date_value(raw)
-            if parsed:
-                return parsed
-    return None
+    # 2) <time datetime> outside junk chrome.
+    for el in soup.find_all("time"):
+        if _in_junk_date_context(el):
+            continue
+        raw = _raw_from(el)
+        if not raw or _looks_like_relative_date_text(raw):
+            continue
+        parsed = parse_date_value(raw)
+        if parsed:
+            return parsed
 
+    # 3) Broad class*=date, absolute only, not junk.
+    for el in soup.select(".date, [class*='date'], [class*='Date']")[:50]:
+        if _in_junk_date_context(el):
+            continue
+        raw = _raw_from(el)
+        if not raw or _looks_like_relative_date_text(raw):
+            continue
+        parsed = parse_date_value(raw)
+        if parsed:
+            return parsed
+    return None
 
 
 def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
@@ -1203,13 +1221,14 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
     if url and not page_looks_like_article(soup, url) and not is_probable_article_url(url):
         return None
     path = urlparse(url).path.lower() if url else ""
-    if path.startswith(("/kompanii/", "/company/", "/companies/", "/category/", "/tag/")):
+    if path.startswith(("/kompanii/", "/company/", "/companies/", "/category/", "/tag/", "/themes")):
         return None
 
     jsonld_date = extract_date_from_jsonld(soup)
     if jsonld_date:
         return jsonld_date
 
+    # Meta tags that usually belong to the main article.
     meta_candidates: list[str] = []
     for prop in ("article:published_time", "og:published_time"):
         tag = soup.find("meta", property=prop)
@@ -1220,7 +1239,6 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
         "pubdate",
         "publish-date",
         "publication_date",
-        "date",
         "DC.date",
         "dc.date",
         "sailthru.date",
@@ -1231,21 +1249,19 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
             meta_candidates.append(str(tag["content"]))
 
     tag = soup.find(attrs={"itemprop": "datePublished"})
-    if tag:
+    if tag and not _in_junk_date_context(tag):
         content = tag.get("content") or tag.get("datetime") or tag.get_text(" ", strip=True)
         if content:
             meta_candidates.append(str(content))
 
-    for time_tag in soup.find_all("time"):
-        content = time_tag.get("datetime") or time_tag.get_text(" ", strip=True)
-        if content:
-            meta_candidates.append(str(content))
-
     for raw in meta_candidates:
+        if _looks_like_relative_date_text(raw):
+            continue
         parsed = parse_date_value(raw)
         if parsed:
             return parsed
 
+    # Visible article date BEFORE any leftover <time> scan (tickers first in DOM).
     visible = extract_date_from_visible(soup)
     if visible:
         return visible
@@ -1253,6 +1269,7 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
     if url:
         return extract_date_from_url(url)
     return None
+
 
 
 def extract_main_text(soup: BeautifulSoup) -> str:
@@ -1307,6 +1324,7 @@ NON_ARTICLE_PATH_PREFIXES = (
     "/category/",
     "/tag/",
     "/author/",
+    "/themes",
     "/page/",
     "/wp-admin/",
     "/wp-login",

@@ -35,7 +35,7 @@ def main() -> None:
     doc = Document()
     title = doc.add_heading("Media Monitor — инструкция для пользователя", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    add_para(doc, "Версия программы: v3.3.2", bold=True)
+    add_para(doc, "Версия программы: v3.3.3", bold=True)
     add_para(
         doc,
         "Программа ищет заданные слова и фразы на указанных сайтах СМИ "
@@ -186,7 +186,7 @@ def main() -> None:
         ],
     )
 
-    add_para(doc, "Текущий релиз: v3.3.2", bold=True)
+    add_para(doc, "Текущий релиз: v3.3.3", bold=True)
     doc.save(OUT)
     print(f"Wrote {OUT}")
 
