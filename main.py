@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -33,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1634,6 +1636,23 @@ def format_duration(seconds: float) -> str:
     return f"{s}с"
 
 
+def try_open_file(path: Path) -> bool:
+    """Open a file with the OS default app (Excel for .xlsx)."""
+    try:
+        if not path.is_file():
+            return False
+        if sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log_print(f"Не удалось открыть файл: {exc}")
+        return False
+
+
 def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
     """Keep log file at most max_bytes by trimming oldest content."""
     if not log_path.is_file():
@@ -1906,8 +1925,7 @@ def run(*, interactive_auth: bool = True) -> int:
     if cancelled or is_cancelled():
         log_print()
         log_print(
-            "Остановка завершена: текущие запросы дождались ответа, "
-            "остальные страницы не сканировались."
+            "Остановка завершена: сеть закрыта, оставшиеся страницы не сканировались."
         )
         if stopped_sites:
             log_print(f"Остановлено сайтов: {stopped_sites}.")
@@ -1940,6 +1958,10 @@ def run(*, interactive_auth: bool = True) -> int:
         + ("." if not (cancelled or is_cancelled()) else " (запуск прерван).")
     )
     log_print(f"Отчёт: {report_path}")
+    if try_open_file(report_path):
+        log_print("Отчёт открыт в Excel (если установлено приложение по умолчанию).")
+    else:
+        log_print("Отчёт не удалось открыть автоматически — откройте папку «Отчёты».")
     log_print(f"Время: {format_duration(elapsed)} ({elapsed:.1f}s)")
     log_print(f"media-monitor v{VERSION}")
     return 0
