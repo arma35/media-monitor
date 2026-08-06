@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,6 +66,8 @@ _LOG_CALLBACK: Callable[[str], None] | None = None
 _DETAIL_CALLBACK: Callable[[str], None] | None = None
 # Optional live progress sink for GUI status panel (dict snapshot).
 _PROGRESS_CALLBACK: Callable[[dict], None] | None = None
+# Append-only log file handle — detail lines always go here (full run history).
+_LOG_FILE: TextIO | None = None
 # Cooperative cancel for GUI Stop button.
 _CANCEL = threading.Event()
 
@@ -92,6 +94,23 @@ def set_detail_callback(callback: Callable[[str], None] | None) -> None:
 def set_progress_callback(callback: Callable[[dict], None] | None) -> None:
     global _PROGRESS_CALLBACK
     _PROGRESS_CALLBACK = callback
+
+
+def set_log_file(handle: TextIO | None) -> None:
+    """File handle for full run log (status + detail always written here)."""
+    global _LOG_FILE
+    _LOG_FILE = handle
+
+
+def _write_log_file(line: str) -> None:
+    fh = _LOG_FILE
+    if fh is None:
+        return
+    try:
+        fh.write(line)
+        fh.flush()
+    except Exception:
+        pass
 
 
 def register_session(session: requests.Session) -> None:
@@ -149,6 +168,10 @@ def log_print(*args: object, **kwargs: object) -> None:
             print(*args, **kwargs)
         except Exception:
             pass
+        # When stdout is Tee'd to the log file, print already wrote there.
+        # If not Tee'd (or Tee failed), still append once via handle.
+        if _LOG_FILE is not None and not isinstance(sys.stdout, Tee):
+            _write_log_file(line)
         cb = _LOG_CALLBACK
         if cb is not None:
             try:
@@ -166,8 +189,8 @@ def log_print(*args: object, **kwargs: object) -> None:
 def detail_print(*args: object, **kwargs: object) -> None:
     """
     Detailed progress (URL/search/errors).
-    Always goes to the GUI «Полный лог» tab when a detail callback is set.
-    Also printed to console/file when log_verbose=1.
+    Always goes to media-monitor_log.txt and the GUI «Полный лог» tab.
+    Console/status stay quiet unless log_verbose=1.
     """
     ensure_stdio()
     sep = str(kwargs.get("sep", " "))
@@ -179,6 +202,9 @@ def detail_print(*args: object, **kwargs: object) -> None:
                 print(*args, **kwargs)
             except Exception:
                 pass
+        else:
+            # Full detail always lands in the log file (not the Status tab).
+            _write_log_file(line)
         detail_cb = _DETAIL_CALLBACK
         if detail_cb is not None:
             try:
@@ -413,6 +439,47 @@ def load_lines(path: Path) -> list[str]:
             continue
         lines.append(line)
     return lines
+
+
+def _looks_like_site_token(token: str) -> bool:
+    t = token.strip()
+    if not t:
+        return False
+    if t.startswith(("http://", "https://")):
+        return True
+    return bool(re.match(r"^(?:www\.)?[a-z0-9\-]+(?:\.[a-z0-9\-]+)+/?$", t, re.I))
+
+
+def load_commented_sites(path: Path) -> list[str]:
+    """
+    Sites disabled with leading # in sites.txt.
+    Example: «# https://example.ru  # недоступен 2026-08-06»
+    """
+    if not path.is_file():
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line.startswith("#"):
+            continue
+        body = line.lstrip("#").strip()
+        if not body:
+            continue
+        # Drop trailing annotation like «# недоступен 2026-08-06»
+        body = re.sub(r"\s+#\s*.*$", "", body).strip()
+        if not body:
+            continue
+        token = body.split()[0]
+        if not _looks_like_site_token(token):
+            continue
+        url = normalize_url(token)
+        key = site_host_key(url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(url)
+    return found
 
 
 def load_settings(path: Path) -> Settings:
@@ -1814,6 +1881,7 @@ def write_report(
     generated_at: datetime,
     duration_seconds: float,
     unavailable_sites: list[str] | None = None,
+    commented_sites: list[str] | None = None,
 ) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = generated_at.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1843,6 +1911,7 @@ def write_report(
     ws["F1"].font = Font(bold=True)
     ws["G1"].font = Font(bold=True)
 
+    # 1) Found pages first (normal rows).
     for hit in hits:
         ws.append(
             (
@@ -1864,9 +1933,19 @@ def write_report(
                 cell.hyperlink = str(cell.value)
                 cell.style = "Hyperlink"
 
+    # 2) Red block ONLY at the end: unavailable this run + commented in sites.txt.
     red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+    red_rows: dict[str, tuple[str, str]] = {}
     for site in unavailable_sites or []:
-        ws.append((site, "недоступен", "", "", "", "", ""))
+        key = site_host_key(site) or site
+        red_rows[key] = (site, "недоступен")
+    for site in commented_sites or []:
+        key = site_host_key(site) or site
+        if key not in red_rows:
+            red_rows[key] = (site, "закомментирован")
+
+    for site, status in sorted(red_rows.values(), key=lambda x: site_host_key(x[0]) or x[0]):
+        ws.append((site, status, "", "", "", "", ""))
         row_idx = ws.max_row
         for col in (1, 2):
             cell = ws.cell(row=row_idx, column=col)
@@ -2067,6 +2146,9 @@ def run(*, interactive_auth: bool = True) -> int:
                 f"({', '.join(sorted(unavailable_hosts))})"
             )
 
+    # After possible auto-comment: all # sites go to the red block at report end.
+    commented_sites = load_commented_sites(sites_path)
+
     # Curator: one Excel write after all workers finish.
     report_path = write_report(
         hits,
@@ -2074,6 +2156,7 @@ def run(*, interactive_auth: bool = True) -> int:
         datetime.now(),
         time.monotonic() - started_mono,
         unavailable_sites=unavailable,
+        commented_sites=commented_sites,
     )
     elapsed = time.monotonic() - started_mono
     log_print()
@@ -2081,6 +2164,7 @@ def run(*, interactive_auth: bool = True) -> int:
         f"Итог: сайтов {total_sites}, страниц {pages_total}, "
         f"находок {len(hits)}, ошибок {errors}"
         + (f", недоступных {len(unavailable)}" if unavailable else "")
+        + (f", закомментированных {len(commented_sites)}" if commented_sites else "")
         + (f", остановлено {stopped_sites}" if stopped_sites else "")
         + (f", пропуск auth {skipped_auth}" if skipped_auth else "")
         + ("." if not (cancelled or is_cancelled()) else " (запуск прерван).")
@@ -2126,6 +2210,7 @@ def console_main() -> int:
         started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"\n===== media-monitor v{VERSION} start {started} =====\n")
         log_file.flush()
+        set_log_file(log_file)
         sys.stdout = Tee(original_stdout, log_file)  # type: ignore[assignment]
         sys.stderr = Tee(original_stderr, log_file)  # type: ignore[assignment]
         code = run(interactive_auth=True)
@@ -2133,6 +2218,7 @@ def console_main() -> int:
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
+        set_log_file(None)
         ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_file.write(f"===== media-monitor v{VERSION} end {ended} =====\n")
         log_file.close()

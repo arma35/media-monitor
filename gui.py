@@ -347,6 +347,7 @@ class App:
                     f"\n===== media-monitor v{mm.VERSION} start {started} =====\n"
                 )
                 log_file.flush()
+                mm.set_log_file(log_file)
                 sys.stdout = mm.Tee(original_stdout, log_file)  # type: ignore[assignment]
                 sys.stderr = mm.Tee(original_stderr, log_file)  # type: ignore[assignment]
                 code = mm.run(interactive_auth=False)
@@ -359,6 +360,7 @@ class App:
             finally:
                 sys.stdout = original_stdout
                 sys.stderr = original_stderr
+                mm.set_log_file(None)
                 if log_file is not None:
                     ended = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     log_file.write(
