@@ -18,7 +18,7 @@ import warnings
 from concurrent.futures import CancelledError as FuturesCancelledError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Iterable, TextIO
@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -766,56 +766,76 @@ def parse_date_value(raw: str) -> date | None:
     if not value:
         return None
 
+    # Relative Russian dates (common in feeds / some article headers).
+    low = value.lower()
+    if re.match(r"^сегодня\b", low):
+        return date.today()
+    if re.match(r"^вчера\b", low):
+        return date.today() - timedelta(days=1)
+    if re.match(r"^позавчера\b", low):
+        return date.today() - timedelta(days=2)
+
     # ISO / HTML5 datetime
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
     except ValueError:
         pass
 
-    head = re.split(r"[T\s]", value, maxsplit=1)[0]
+    head = re.split(r"[T\s,]", value, maxsplit=1)[0]
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(head, fmt).date()
         except ValueError:
             continue
 
-    # Dates written in text, e.g. "5 августа 2026", "5 Aug 2026".
+    # Dates written in text, e.g. "5 августа 2026", "27 декабря 2024 года, 20:27".
     months_ru = {
         "января": 1,
+        "январь": 1,
         "янв.": 1,
         "янв": 1,
         "февраля": 2,
+        "февраль": 2,
         "февр.": 2,
         "фев": 2,
         "марта": 3,
+        "март": 3,
         "март.": 3,
         "мар": 3,
         "апреля": 4,
+        "апрель": 4,
         "апр.": 4,
         "апр": 4,
         "мая": 5,
-        "май.": 5,
         "май": 5,
+        "май.": 5,
         "июня": 6,
+        "июнь": 6,
         "июн.": 6,
         "июн": 6,
         "июля": 7,
+        "июль": 7,
         "июл.": 7,
         "июл": 7,
         "августа": 8,
+        "август": 8,
         "авг.": 8,
         "авг": 8,
         "сентября": 9,
+        "сентябрь": 9,
         "сен.": 9,
         "сен": 9,
         "сент": 9,
         "октября": 10,
+        "октябрь": 10,
         "окт.": 10,
         "окт": 10,
         "ноября": 11,
+        "ноябрь": 11,
         "ноя.": 11,
         "ноя": 11,
         "декабря": 12,
+        "декабрь": 12,
         "дек.": 12,
         "дек": 12,
     }
@@ -846,12 +866,15 @@ def parse_date_value(raw: str) -> date | None:
         "december": 12,
     }
 
-    m = re.search(r"(?i)(\d{1,2})\s*([a-zа-яё\.]+)\s*(\d{4})", value)
+    m = re.search(
+        r"(?i)(\d{1,2})\s*([a-zа-яё\.]+)\s*(\d{4})(?:\s*г(?:ода|\.)?)?",
+        value,
+    )
     if m:
         day = int(m.group(1))
-        mon_raw = m.group(2).strip().lower()
+        mon_raw = m.group(2).strip().lower().rstrip(".")
         year = int(m.group(3))
-        mon = months_ru.get(mon_raw) or months_en.get(mon_raw)
+        mon = months_ru.get(mon_raw) or months_ru.get(mon_raw + ".") or months_en.get(mon_raw)
         if mon:
             try:
                 return date(year, mon, day)
@@ -863,6 +886,16 @@ def parse_date_value(raw: str) -> date | None:
         return parsedate_to_datetime(value).date()
     except (TypeError, ValueError, IndexError):
         return None
+
+
+def _looks_like_relative_date_text(raw: str) -> bool:
+    t = raw.strip().lower()
+    if re.match(r"^(сегодня|вчера|позавчера)\b", t):
+        return True
+    if re.match(r"^\d+\s*(час|часа|часов|мин|минут)\b", t):
+        return True
+    return False
+
 
 
 ARTICLE_JSONLD_TYPES = {
@@ -1024,25 +1057,78 @@ def extract_date_from_url(url: str) -> date | None:
 
 
 def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
-    selectors = (
-        ".detailed-page__date",
+    """
+    Pull a publish date from visible page chrome.
+    Prefer article-specific blocks (e.g. dostup1 .subtitle__date) over feed
+    widgets that often say only «сегодня, 18:27».
+    """
+    preferred = (
+        ".subtitle__date",
+        ".article-date",
+        ".article__date",
         ".news-date",
         ".publication-date",
         ".pub-date",
-        ".date",
+        ".detailed-page__date",
+        ".material-date",
+        ".b-article__date",
+        ".post-date",
+        ".entry-date",
+        "time[datetime]",
+        "[itemprop='datePublished']",
+        "[class*='subtitle__date']",
+        "[class*='article__date']",
+        "[class*='article-date']",
+        "[class*='publish']",
+    )
+    broad = (
         "time",
+        ".date",
         "[class*='date']",
         "[class*='Date']",
     )
-    for sel in selectors:
-        for el in soup.select(sel)[:8]:
-            raw = el.get("datetime") or el.get_text(" ", strip=True)
+
+    def _raw_from(el) -> str:
+        return str(
+            el.get("datetime")
+            or el.get("content")
+            or el.get_text(" ", strip=True)
+            or ""
+        ).strip()
+
+    # 1) Specific article date blocks — absolute dates first.
+    for sel in preferred:
+        for el in soup.select(sel)[:15]:
+            raw = _raw_from(el)
             if not raw:
                 continue
-            parsed = parse_date_value(str(raw))
+            if _looks_like_relative_date_text(raw):
+                continue
+            parsed = parse_date_value(raw)
+            if parsed:
+                return parsed
+
+    # 2) Broad selectors — only absolute dates (skip feed «сегодня»).
+    for sel in broad:
+        for el in soup.select(sel)[:40]:
+            raw = _raw_from(el)
+            if not raw or _looks_like_relative_date_text(raw):
+                continue
+            parsed = parse_date_value(raw)
+            if parsed:
+                return parsed
+
+    # 3) Relative date only from preferred article chrome.
+    for sel in preferred:
+        for el in soup.select(sel)[:15]:
+            raw = _raw_from(el)
+            if not raw:
+                continue
+            parsed = parse_date_value(raw)
             if parsed:
                 return parsed
     return None
+
 
 
 def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
@@ -1067,9 +1153,11 @@ def extract_published_date(soup: BeautifulSoup, url: str = "") -> date | None:
         "pubdate",
         "publish-date",
         "publication_date",
+        "date",
         "DC.date",
         "dc.date",
         "sailthru.date",
+        "MediatorArticlePublishDate",
     ):
         tag = soup.find("meta", attrs={"name": name})
         if tag and tag.get("content"):
