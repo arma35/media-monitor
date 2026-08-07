@@ -82,8 +82,14 @@ class GuiLog:
                     self.widget.delete("1.0", f"{last - self.max_lines}.0")
             self.widget.see("end")
             self.widget.configure(state="disabled")
-        # Drain faster while backlog remains; keep UI responsive.
-        delay = 40 if n >= self.batch_per_tick else 100
+        # Fast while draining; slow right down when idle so a finished
+        # window does not keep burning a few % CPU on empty after() ticks.
+        if n >= self.batch_per_tick:
+            delay = 40
+        elif n or dropped:
+            delay = 100
+        else:
+            delay = 750
         self.root.after(delay, self.pump)
 
 
@@ -96,11 +102,14 @@ class App:
 
         self.worker: threading.Thread | None = None
         self.running = False
+        self.paused = False
         self.last_report: Path | None = None
         self._progress_q: queue.Queue[dict] = queue.Queue()
         self._cached_workers = 0
         self._run_started_mono: float | None = None
         self._elapsed_job: str | None = None
+        self._pause_started_mono: float | None = None
+        self._pause_accumulated = 0.0
 
         self._build()
         # Show the window first; load configs on the next Tk tick so startup
@@ -132,6 +141,8 @@ class App:
         self.dates_lbl.pack(anchor="w", pady=(2, 0))
         self.progress_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
         self.progress_lbl.pack(anchor="w", pady=(2, 0))
+        self.cache_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
+        self.cache_lbl.pack(anchor="w", pady=(2, 0))
 
         self.progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
         self.progress_bar.pack(fill="x", padx=10, pady=(0, 4))
@@ -141,6 +152,11 @@ class App:
 
         self.btn_start = ttk.Button(btns, text="Старт", command=self.on_start)
         self.btn_start.pack(side="left", padx=(0, 6))
+
+        self.btn_pause = ttk.Button(
+            btns, text="Пауза", command=self.on_pause, state="disabled"
+        )
+        self.btn_pause.pack(side="left", padx=(0, 6))
 
         self.btn_stop = ttk.Button(btns, text="Стоп", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(0, 6))
@@ -197,7 +213,8 @@ class App:
             root,
             text=(
                 "«Статус» — кратко по сайтам. «Полный лог» — что качается прямо сейчас. "
-                "Стоп закрывает сеть сразу; Excel сохранится. Консоль: --console"
+                "Пауза — временно остановить набор новых страниц; Стоп — прервать и сохранить Excel. "
+                "Консоль: --console"
             ),
             foreground="#555",
             wraplength=880,
@@ -218,13 +235,17 @@ class App:
         self._elapsed_job = None
         if self._run_started_mono is None:
             return
-        elapsed = time.monotonic() - self._run_started_mono
+        elapsed = time.monotonic() - self._run_started_mono - self._pause_accumulated
+        if self.paused and self._pause_started_mono is not None:
+            elapsed -= time.monotonic() - self._pause_started_mono
         self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
         if self.running:
             self._elapsed_job = self.root.after(500, self._tick_elapsed)
 
     def _start_elapsed(self) -> None:
         self._run_started_mono = time.monotonic()
+        self._pause_accumulated = 0.0
+        self._pause_started_mono = None
         self.elapsed_lbl.configure(text="Время: 0с")
         if self._elapsed_job is not None:
             try:
@@ -291,6 +312,7 @@ class App:
         )
         if not self.running:
             self.progress_lbl.configure(text="")
+            self.cache_lbl.configure(text="")
             self.progress_bar["value"] = 0
 
     def _on_progress(self, snap: dict) -> None:
@@ -306,7 +328,9 @@ class App:
             pass
         if latest is not None:
             self._apply_progress(latest)
-        self.root.after(150, self._pump_progress)
+        # While scanning — snappy; after finish — barely tick.
+        delay = 150 if self.running else 1000
+        self.root.after(delay, self._pump_progress)
 
     def _apply_progress(self, snap: dict) -> None:
         done = int(snap.get("done", 0))
@@ -316,7 +340,11 @@ class App:
         workers = int(snap.get("workers", self._cached_workers))
         unavailable = int(snap.get("unavailable", 0))
         cancelling = bool(snap.get("cancelling", False))
+        paused = bool(snap.get("paused", False))
         names = snap.get("active_names") or []
+        cache_before = int(snap.get("cache_before", 0))
+        cache_skipped = int(snap.get("cache_skipped", 0))
+        cache_added = int(snap.get("cache_added", 0))
 
         self.progress_bar["maximum"] = total
         self.progress_bar["value"] = done
@@ -334,6 +362,14 @@ class App:
                     "Сеть закрыта, Excel сохранится."
                 )
             )
+        elif paused:
+            self.status.configure(text=f"Пауза… {done}/{total}")
+            self.progress_lbl.configure(
+                text=(
+                    f"Пауза: готово {done}/{total} | находок {hits} | "
+                    f"активных сайтов {active}. Нажмите «Продолжить»."
+                )
+            )
         else:
             self.status.configure(text=f"Сканирование… {done}/{total}")
             line = (
@@ -346,6 +382,13 @@ class App:
                 line += f" | {names_txt}"
             self.progress_lbl.configure(text=line)
 
+        self.cache_lbl.configure(
+            text=(
+                f"БД кэш: было {cache_before} | проверено ранее (пропуск) {cache_skipped} | "
+                f"добавлено сейчас {cache_added}"
+            )
+        )
+
     def append(self, text: str) -> None:
         self.gui_log.write_line(text if text.endswith("\n") else text + "\n")
 
@@ -355,15 +398,19 @@ class App:
         # Do not call _refresh_counts here — it can stall the UI briefly;
         # counts were refreshed at idle and will refresh again when done.
         self.running = True
+        self.paused = False
         self.btn_start.configure(state="disabled")
+        self.btn_pause.configure(state="normal", text="Пауза")
         self.btn_stop.configure(state="normal")
         self.status.configure(text="Сканирование…")
         self.progress_lbl.configure(text="Запуск…")
+        self.cache_lbl.configure(text="БД кэш: …")
         self.progress_bar["value"] = 0
         self._start_elapsed()
         self.gui_log.clear()
         self.gui_detail.clear()
         mm.clear_cancel()
+        mm.clear_pause()
         mm.set_log_callback(self.gui_log.write_line)
         mm.set_detail_callback(self.gui_detail.write_line)
         mm.set_progress_callback(self._on_progress)
@@ -415,7 +462,9 @@ class App:
 
     def _on_done(self, code: int) -> None:
         self.running = False
+        self.paused = False
         self.btn_start.configure(state="normal")
+        self.btn_pause.configure(state="disabled", text="Пауза")
         self.btn_stop.configure(state="disabled")
         self._stop_elapsed(freeze=True)
         if mm.is_cancelled():
@@ -426,11 +475,40 @@ class App:
             self.status.configure(text="Завершено с ошибкой")
         self._refresh_counts()
 
+    def on_pause(self) -> None:
+        if not self.running:
+            return
+        if self.paused:
+            mm.request_resume()
+            if self._pause_started_mono is not None:
+                self._pause_accumulated += time.monotonic() - self._pause_started_mono
+                self._pause_started_mono = None
+            self.paused = False
+            self.btn_pause.configure(text="Пауза")
+            self.status.configure(text="Сканирование…")
+            self.append("\nПауза снята — продолжаю.\n")
+        else:
+            mm.request_pause()
+            self._pause_started_mono = time.monotonic()
+            self.paused = True
+            self.btn_pause.configure(text="Продолжить")
+            self.status.configure(text="Пауза…")
+            self.append(
+                "\nПауза: новые страницы не берутся, текущие запросы докачиваются. "
+                "Нажмите «Продолжить».\n"
+            )
+
     def on_stop(self) -> None:
         if not self.running:
             return
+        if self.paused:
+            # Ensure workers are not stuck in pause wait.
+            mm.request_resume()
+            self.paused = False
+            self.btn_pause.configure(text="Пауза")
         mm.request_cancel()
         self.status.configure(text="Остановка…")
+        self.btn_pause.configure(state="disabled")
         self.append(
             "\nОстановка: закрываю сеть, новые страницы не берутся. "
             "Excel сохранится с тем, что уже нашли.\n"

@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "4.0.2"
+VERSION = "4.1.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -73,6 +73,8 @@ _PROGRESS_CALLBACK: Callable[[dict], None] | None = None
 _LOG_FILE: TextIO | None = None
 # Cooperative cancel for GUI Stop button.
 _CANCEL = threading.Event()
+# Cooperative pause for GUI Pause button (set = paused).
+_PAUSE = threading.Event()
 
 
 class AuthRequiredError(Exception):
@@ -159,6 +161,8 @@ def _close_all_sessions() -> int:
 
 def request_cancel() -> None:
     _CANCEL.set()
+    # Wake paused workers so they can exit promptly.
+    _PAUSE.clear()
     n = _close_all_sessions()
     if n:
         log_print(
@@ -167,14 +171,51 @@ def request_cancel() -> None:
         )
 
 
+def request_pause() -> None:
+    """Pause scanning between pages (in-flight HTTP still finishes)."""
+    if not _CANCEL.is_set():
+        _PAUSE.set()
+        log_print("Пауза: новые страницы не берутся, текущие докачиваются…")
+
+
+def request_resume() -> None:
+    if _PAUSE.is_set():
+        _PAUSE.clear()
+        log_print("Пауза снята — продолжаю сканирование.")
+
+
+def clear_pause() -> None:
+    _PAUSE.clear()
+
+
+def is_paused() -> bool:
+    return _PAUSE.is_set()
+
+
+def wait_if_paused() -> None:
+    """Block while paused; return immediately if cancelled."""
+    while _PAUSE.is_set():
+        if _CANCEL.is_set():
+            return
+        time.sleep(0.2)
+
+
 def clear_cancel() -> None:
     _CANCEL.clear()
+    _PAUSE.clear()
     with _SESSIONS_LOCK:
         _ACTIVE_SESSIONS.clear()
 
 
 def is_cancelled() -> bool:
     return _CANCEL.is_set()
+
+
+def check_cancel_point() -> None:
+    """Raise CancelledError if Stop was pressed; wait while Pause is on."""
+    wait_if_paused()
+    if is_cancelled():
+        raise CancelledError()
 
 
 def log_print(*args: object, **kwargs: object) -> None:
@@ -444,14 +485,18 @@ class ScanCache:
         published: date | None,
         had_hit: bool,
         title: str = "",
-    ) -> None:
+    ) -> bool:
+        """Upsert URL into cache. Returns True if this URL was new."""
         if self._conn is None or not phrases_hash:
-            return
+            return False
         key = cache_url_key(url)
         now = datetime.now().isoformat(timespec="seconds")
         published_str = published.isoformat() if published else ""
         title_clean = (title or "")[:500]
         with self._lock:
+            existed = self._conn.execute(
+                "SELECT 1 FROM scanned_pages WHERE url = ? LIMIT 1", (key,)
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO scanned_pages
@@ -474,6 +519,7 @@ class ScanCache:
                 ),
             )
             self._conn.commit()
+            return existed is None
 
 
 @dataclass
@@ -488,6 +534,9 @@ class RunProgress:
     pages: int = 0
     unavailable: int = 0
     cancelled_sites: int = 0
+    cache_before: int = 0
+    cache_skipped: int = 0
+    cache_added: int = 0
     active: set[str] = field(default_factory=set)
 
     def site_start(self, label: str) -> None:
@@ -518,6 +567,16 @@ class RunProgress:
         self._notify()
         return done, hits
 
+    def note_cache_skip(self, n: int = 1) -> None:
+        with self._lock:
+            self.cache_skipped += n
+        self._notify()
+
+    def note_cache_add(self, n: int = 1) -> None:
+        with self._lock:
+            self.cache_added += n
+        self._notify()
+
     def snapshot(self) -> dict:
         with self._lock:
             names = sorted(self.active)
@@ -532,6 +591,10 @@ class RunProgress:
                 "active_names": names[:6],
                 "workers": self.workers,
                 "cancelling": is_cancelled(),
+                "paused": is_paused(),
+                "cache_before": self.cache_before,
+                "cache_skipped": self.cache_skipped,
+                "cache_added": self.cache_added,
             }
 
     def _notify(self) -> None:
@@ -1311,6 +1374,8 @@ def extract_date_from_visible(soup: BeautifulSoup) -> date | None:
     Examples: dostup1 `.subtitle__date`, vestniksr `.bi_date_pub time`.
     """
     preferred = (
+        ".main-dots .today",
+        ".today",
         ".bi_date_pub",
         ".bi_date_pub time",
         ".subtitle__date",
@@ -1502,8 +1567,21 @@ NON_ARTICLE_PATH_PREFIXES = (
     "/news/articles/",
     "/news/longread/",
     "/news/main/",
+    "/news/search/",
     "/russia/news/",
+    "/moi-raion",
+    "/payment/",
+    "/passengers/",
+    "/spetsproekty",
+    "/putevoditel/spetsproekty",
+    "/nedvizhimost/",
+    "/ministries/",
+    "/organization_",
+    "/common_",
+    "/tag_thematic",
+    "/tag_",
 )
+
 
 # Bare section roots (listings, not articles)
 NON_ARTICLE_EXACT_PATHS = {
@@ -1516,12 +1594,21 @@ NON_ARTICLE_EXACT_PATHS = {
     "/sport/",
     "/culture/",
     "/testy/",
+    "/app/",
+    "/newspaper/",
+    "/rss.xml",
 }
 
 
 def is_probable_article_url(url: str) -> bool:
-    path = urlparse(url).path.lower().rstrip("/") + "/"
+    parsed = urlparse(url)
+    path = parsed.path.lower().rstrip("/") + "/"
+    low_path = parsed.path.lower()
     if path == "/":
+        return False
+    if low_path.endswith((".xml", ".rss", ".atom", ".json")):
+        return False
+    if "rss" in low_path.split("/")[-1]:
         return False
     if path in NON_ARTICLE_EXACT_PATHS:
         return False
@@ -1529,6 +1616,9 @@ def is_probable_article_url(url: str) -> bool:
         if path.startswith(prefix) or prefix.rstrip("/") == path.rstrip("/"):
             return False
     if re.search(r"/page/\d+/?", path):
+        return False
+    # RIA hubs: /organization_X/, /common_X/, thematic tags
+    if re.search(r"^/(?:organization_|common_|tag_)[\w\-]+/?$", path):
         return False
     return True
 
@@ -1711,18 +1801,21 @@ def scan_page(
     excluded: set[str] | None = None,
     cache: ScanCache | None = None,
     phrases_hash: str = "",
-) -> list[Hit]:
+) -> tuple[list[Hit], int]:
+    """Scan one URL. Returns (hits, cache_rows_newly_inserted)."""
     if excluded and is_excluded_url(url, excluded):
-        return []
+        return [], 0
 
     html = fetch_html(url, session, auth=auth, ssl_verify=settings.ssl_verify)
     soup = BeautifulSoup(html, "lxml")
+    cache_added = 0
 
     # Seeds may be categories; expanded company cards must not become report rows.
     if not is_probable_article_url(url) and not page_looks_like_article(soup, url):
         if cache is not None:
-            cache.record(url, phrases_hash, published=None, had_hit=False, title="")
-        return []
+            if cache.record(url, phrases_hash, published=None, had_hit=False, title=""):
+                cache_added = 1
+        return [], cache_added
 
     title = extract_title(soup)
     published = extract_published_date(soup, url)
@@ -1735,10 +1828,11 @@ def scan_page(
         settings.article_date_last_days,
     ):
         if cache is not None:
-            cache.record(
+            if cache.record(
                 url, phrases_hash, published=published, had_hit=False, title=title
-            )
-        return []
+            ):
+                cache_added = 1
+        return [], cache_added
 
     published_str = published.isoformat() if published else ""
     hits: list[Hit] = []
@@ -1754,14 +1848,15 @@ def scan_page(
                 )
             )
     if cache is not None:
-        cache.record(
+        if cache.record(
             url,
             phrases_hash,
             published=published,
             had_hit=bool(hits),
             title=title,
-        )
-    return hits
+        ):
+            cache_added = 1
+    return hits, cache_added
 
 
 def site_search_urls(origin: str, phrase: str) -> list[str]:
@@ -1824,8 +1919,7 @@ def collect_urls_for_site(
         result.append(url)
 
     def add_links_from(page_url: str) -> None:
-        if is_cancelled():
-            raise CancelledError()
+        check_cancel_point()
         if full():
             return
         try:
@@ -1847,27 +1941,23 @@ def collect_urls_for_site(
             detail_print(f"  [{site_label}] [warn] cannot expand {page_url}: {exc}")
 
     for url in seed_urls:
-        if is_cancelled():
-            raise CancelledError()
+        check_cancel_point()
         add(url)
 
     origin = f"{urlparse(seed_urls[0]).scheme}://{urlparse(seed_urls[0]).netloc}"
     for phrase in phrases:
-        if is_cancelled():
-            raise CancelledError()
+        check_cancel_point()
         if full():
             break
         for search_url in site_search_urls(origin, phrase):
-            if is_cancelled():
-                raise CancelledError()
+            check_cancel_point()
             if full():
                 break
             detail_print(f"  [{site_label}] search: {search_url}")
             add_links_from(search_url)
 
     for url in seed_urls:
-        if is_cancelled():
-            raise CancelledError()
+        check_cancel_point()
         if full():
             break
         path = urlparse(url).path.rstrip("/")
@@ -1910,8 +2000,7 @@ def process_site(
 
     result = SiteResult(origin=origin, label=label)
     try:
-        if is_cancelled():
-            raise CancelledError()
+        check_cancel_point()
 
         probe_url = seeds[0] if seeds else origin
         detail_print(f"  [{label}] проверка доступности: {probe_url}")
@@ -1932,8 +2021,7 @@ def process_site(
             detail_print(f"  [{label}] [error] сайт недоступен: {exc}")
 
         if not result.unavailable:
-            if is_cancelled():
-                raise CancelledError()
+            check_cancel_point()
             urls = collect_urls_for_site(
                 seeds, phrases, session, auth, settings, label
             )
@@ -1943,21 +2031,21 @@ def process_site(
             detail_print(f"  [{label}] к скану {len(urls)} стр.")
 
             for i, url in enumerate(urls, start=1):
-                if is_cancelled():
-                    raise CancelledError()
+                check_cancel_point()
                 if (
                     cache is not None
                     and settings.skip_seen_days > 0
                     and cache.should_skip(url, phrases_hash, settings.skip_seen_days)
                 ):
                     result.pages_skipped_cache += 1
+                    progress.note_cache_skip()
                     detail_print(
                         f"  [{label}] [{i}/{len(urls)}] [cache] уже смотрели: {url}"
                     )
                     continue
                 detail_print(f"  [{label}] [{i}/{len(urls)}] {url}")
                 try:
-                    page_hits = scan_page(
+                    page_hits, cache_new = scan_page(
                         url,
                         phrases,
                         session,
@@ -1969,6 +2057,8 @@ def process_site(
                         phrases_hash=phrases_hash,
                     )
                     result.pages_scanned += 1
+                    if cache_new:
+                        progress.note_cache_add(cache_new)
                     if page_hits:
                         result.hits.extend(page_hits)
                         for hit in page_hits:
@@ -2098,6 +2188,18 @@ def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None
         pass
 
 
+def _excel_safe_text(value: object) -> str:
+    """Strip characters illegal in OOXML shared strings (Excel repair dialog)."""
+    text = "" if value is None else str(value)
+    # XML 1.0 forbidden controls except tab/LF/CR
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+
+def _style_as_hyperlink(cell) -> None:
+    """Blue underlined look without named style 'Hyperlink' (avoids Excel repair)."""
+    cell.font = Font(color="0563C1", underline="single")
+
+
 def write_report(
     hits: list[Hit],
     reports_dir: Path,
@@ -2138,10 +2240,10 @@ def write_report(
     for hit in hits:
         ws.append(
             (
-                hit.phrase,
-                hit.url,
-                hit.published_at,
-                hit.title,
+                _excel_safe_text(hit.phrase),
+                _excel_safe_text(hit.url),
+                _excel_safe_text(hit.published_at),
+                _excel_safe_text(hit.title),
                 hit.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
                 "",
                 "",
@@ -2154,7 +2256,7 @@ def write_report(
             cell = row[1]
             if cell.value and str(cell.value).startswith("http"):
                 cell.hyperlink = str(cell.value)
-                cell.style = "Hyperlink"
+                _style_as_hyperlink(cell)
 
     # 2) Red block ONLY at the end: unavailable this run + commented in sites.txt.
     red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
@@ -2168,14 +2270,16 @@ def write_report(
             red_rows[key] = (site, "закомментирован")
 
     for site, status in sorted(red_rows.values(), key=lambda x: site_host_key(x[0]) or x[0]):
-        ws.append((site, status, "", "", "", "", ""))
+        ws.append((_excel_safe_text(site), _excel_safe_text(status), "", "", "", "", ""))
         row_idx = ws.max_row
         for col in (1, 2):
             cell = ws.cell(row=row_idx, column=col)
             cell.fill = red_fill
             cell.font = Font(bold=True, color="FFFFFF")
         if str(site).startswith("http"):
-            ws.cell(row=row_idx, column=1).hyperlink = str(site)
+            link_cell = ws.cell(row=row_idx, column=1)
+            link_cell.hyperlink = str(site)
+            # Keep white bold on red; Excel still opens the link.
 
     widths = (36, 70, 20, 50, 22, 14, 22)
     for idx, width in enumerate(widths, start=1):
@@ -2249,12 +2353,14 @@ def run(*, interactive_auth: bool = True) -> int:
     cache_path = root / CACHE_NAME
     phrases_hash = phrases_fingerprint(phrases) if phrases else ""
     cache: ScanCache | None = None
+    cache_before = 0
     if settings.skip_seen_days > 0:
         cache = ScanCache(cache_path)
         try:
             cache.open()
+            cache_before = cache.count()
             log_print(
-                f"Кэш: {CACHE_NAME} ({cache.count()} стр.), "
+                f"Кэш: {CACHE_NAME} — в БД сейчас {cache_before} ссылок; "
                 f"не сканировать повторно {settings.skip_seen_days} дн. "
                 f"(fingerprint слов: {phrases_hash})"
             )
@@ -2265,6 +2371,7 @@ def run(*, interactive_auth: bool = True) -> int:
             except Exception:
                 pass
             cache = None
+            cache_before = 0
     else:
         log_print(
             f"Кэш: выкл. (skip_seen_days=0). Файл {CACHE_NAME} не используется."
@@ -2317,7 +2424,9 @@ def run(*, interactive_auth: bool = True) -> int:
     _LOG_VERBOSE = settings.log_verbose
     _CA_BUNDLE = build_ca_bundle() if settings.ssl_verify else False
 
-    progress = RunProgress(total_sites=total_sites, workers=workers)
+    progress = RunProgress(
+        total_sites=total_sites, workers=workers, cache_before=cache_before
+    )
     progress._notify()
     hits: list[Hit] = []
     errors = 0
@@ -2385,14 +2494,24 @@ def run(*, interactive_auth: bool = True) -> int:
                     unavailable.append(site_result.origin)
                     unavailable_hosts.add(site_host_key(site_result.origin))
     finally:
+        cache_after: int | None = None
         if cache is not None:
             try:
-                cache_count = cache.count()
+                cache_after = cache.count()
             except Exception:
-                cache_count = None
+                cache_after = None
             cache.close()
-            if cache_count is not None:
-                log_print(f"Кэш сохранён: {CACHE_NAME} ({cache_count} стр.).")
+        snap = progress.snapshot()
+        skipped = int(snap.get("cache_skipped", 0))
+        added = int(snap.get("cache_added", 0))
+        if cache_before or skipped or added or cache_after is not None:
+            now_txt = str(cache_after) if cache_after is not None else "?"
+            log_print(
+                f"Кэш БД: было {cache_before}, пропуск уже проверенных {skipped}, "
+                f"добавлено новых {added}, стало {now_txt}."
+            )
+            if cache_after is not None:
+                log_print(f"Кэш сохранён: {CACHE_NAME} ({cache_after} стр.).")
 
     if cancelled or is_cancelled():
         log_print()

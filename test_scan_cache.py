@@ -224,7 +224,7 @@ class ScanPageCacheRecordTests(unittest.TestCase):
                     return_value=(date(2026, 7, 7), date(2026, 8, 6)),
                 ),
             ):
-                hits = mm.scan_page(
+                hits, added = mm.scan_page(
                     url,
                     ["тройка"],
                     session=MagicMock(),
@@ -235,6 +235,7 @@ class ScanPageCacheRecordTests(unittest.TestCase):
                     phrases_hash=h,
                 )
             self.assertEqual(hits, [])
+            self.assertEqual(added, 1)
             self.assertTrue(cache.should_skip(url, h, 30))
             cache.close()
 
@@ -268,7 +269,7 @@ class ScanPageCacheRecordTests(unittest.TestCase):
                     return_value=(date(2026, 7, 7), date(2026, 8, 6)),
                 ),
             ):
-                hits = mm.scan_page(
+                hits, added = mm.scan_page(
                     url,
                     ["тройка"],
                     session=MagicMock(),
@@ -279,6 +280,7 @@ class ScanPageCacheRecordTests(unittest.TestCase):
                     phrases_hash=h,
                 )
             self.assertEqual(len(hits), 1)
+            self.assertEqual(added, 1)
             self.assertEqual(hits[0].phrase, "тройка")
             assert cache._conn is not None
             row = cache._conn.execute(
@@ -356,6 +358,51 @@ class VersionTests(unittest.TestCase):
         root = Path(__file__).resolve().parent
         self.assertEqual(mm.VERSION, root.joinpath("VERSION").read_text().strip())
         self.assertTrue(mm.VERSION.startswith("4."))
+
+
+class DateExtractMorvestiTests(unittest.TestCase):
+    def test_today_class_near_title(self) -> None:
+        html = """
+        <html><body>
+          <h1 class="main-title">Новость</h1>
+          <div class="main-dots inner">
+            <p class="today"><span></span>27.05.2022 12:45</p>
+            <p class="flot"><span></span>Лента новостей</p>
+          </div>
+          <div class="main-title-text"><p>Текст</p></div>
+        </body></html>
+        """
+        soup = mm.BeautifulSoup(html, "lxml")
+        got = mm.extract_published_date(
+            soup, "https://morvesti.ru/news/1679/95862/"
+        )
+        self.assertEqual(got, date(2022, 5, 27))
+
+
+class ProbableArticleUrlTests(unittest.TestCase):
+    def test_rejects_non_articles(self) -> None:
+        bad = [
+            "https://tr.ru/rss.xml",
+            "https://www.mos.ru/moi-raion/?filterLabel=transport",
+            "https://mosmetro.ru/payment/tickets/troyka",
+            "https://mosmetro.ru/app",
+            "https://ria.ru/common_karta-troyka/",
+            "https://ria.ru/organization_Trojjka_Dialog/",
+            "https://www.kp.ru/putevoditel/spetsproekty/",
+            "https://moscow-city.guide/nedvizhimost/18513/",
+            "https://tvzvezda.ru/news/search/%23x",
+        ]
+        for url in bad:
+            self.assertFalse(mm.is_probable_article_url(url), url)
+
+    def test_keeps_real_news(self) -> None:
+        good = [
+            "https://morvesti.ru/news/1679/95862/",
+            "https://ria.ru/20260807/news-123.html",
+            "https://lenta.ru/news/2026/08/07/something/",
+        ]
+        for url in good:
+            self.assertTrue(mm.is_probable_article_url(url), url)
 
 
 if __name__ == "__main__":

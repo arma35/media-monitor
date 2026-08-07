@@ -1,0 +1,10 @@
+---
+description: Wishlist for the next Media Monitor build — do not implement until asked
+alwaysApply: true
+---
+
+# Next build wishlist
+
+Do **not** implement these until the user explicitly asks to start the next build.
+
+(Empty after v4.1.0 — pause, DB counters, Excel repair, date/link filters shipped.)
