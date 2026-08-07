@@ -36,7 +36,11 @@ def pack(dist: Path, zip_path: Path) -> None:
             info.date_time = _time.localtime(st.st_mtime)[:6]
             with path.open("rb") as src:
                 zf.writestr(info, src.read())
-            print(f"+ {arcname}")
+            # Avoid UnicodeEncodeError on Windows cp1252 consoles in CI.
+            try:
+                print(f"+ {arcname}")
+            except UnicodeEncodeError:
+                print(f"+ {arcname.encode('unicode_escape').decode('ascii')}")
     print(f"Wrote {zip_path} ({zip_path.stat().st_size} bytes)")
 
 
