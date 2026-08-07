@@ -24,27 +24,30 @@ class GuiLog:
         root: tk.Tk,
         widget: scrolledtext.ScrolledText,
         *,
-        max_lines: int = 0,
-        max_queue: int = 4000,
-        batch_per_tick: int = 40,
+        max_lines: int = 2000,
+        max_queue: int = 1500,
+        batch_per_tick: int = 200,
     ) -> None:
         self.root = root
         self.widget = widget
-        self.q: queue.Queue[str] = queue.Queue()
+        # Bounded queue: under load oldest lines are dropped, not piled up.
+        self.q: queue.Queue[str] = queue.Queue(maxsize=max_queue)
         self.max_lines = max_lines
-        self.max_queue = max_queue
         self.batch_per_tick = batch_per_tick
         self._dropped = 0
 
     def write_line(self, line: str) -> None:
         # Bound the queue so a flood of detail lines cannot freeze Tk forever.
-        while self.q.qsize() >= self.max_queue:
+        while True:
             try:
-                self.q.get_nowait()
-                self._dropped += 1
-            except queue.Empty:
-                break
-        self.q.put(line)
+                self.q.put_nowait(line)
+                return
+            except queue.Full:
+                try:
+                    self.q.get_nowait()
+                    self._dropped += 1
+                except queue.Empty:
+                    return
 
     def clear(self) -> None:
         self.widget.configure(state="normal")
@@ -53,33 +56,34 @@ class GuiLog:
         self._dropped = 0
 
     def pump(self) -> None:
-        n = 0
+        # One Text mutate per tick (join batch) — per-line insert/see freezes Tk.
+        batch: list[str] = []
         try:
-            while n < self.batch_per_tick:
-                line = self.q.get_nowait()
-                self.widget.configure(state="normal")
-                self.widget.insert("end", line)
-                if self.max_lines > 0:
-                    last = int(float(self.widget.index("end-1c")))
-                    if last > self.max_lines:
-                        self.widget.delete("1.0", f"{last - self.max_lines}.0")
-                self.widget.see("end")
-                self.widget.configure(state="disabled")
-                n += 1
+            while len(batch) < self.batch_per_tick:
+                batch.append(self.q.get_nowait())
         except queue.Empty:
             pass
-        if self._dropped:
-            dropped = self._dropped
+        n = len(batch)
+        dropped = self._dropped
+        if dropped:
             self._dropped = 0
+        if batch or dropped:
             self.widget.configure(state="normal")
-            self.widget.insert(
-                "end",
-                f"… пропущено строк лога (чтобы окно не зависало): {dropped}\n",
-            )
+            if batch:
+                self.widget.insert("end", "".join(batch))
+            if dropped:
+                self.widget.insert(
+                    "end",
+                    f"… пропущено строк лога (чтобы окно не зависало): {dropped}\n",
+                )
+            if self.max_lines > 0:
+                last = int(float(self.widget.index("end-1c")))
+                if last > self.max_lines:
+                    self.widget.delete("1.0", f"{last - self.max_lines}.0")
             self.widget.see("end")
             self.widget.configure(state="disabled")
         # Drain faster while backlog remains; keep UI responsive.
-        delay = 30 if n >= self.batch_per_tick else 80
+        delay = 40 if n >= self.batch_per_tick else 100
         self.root.after(delay, self.pump)
 
 
@@ -181,9 +185,12 @@ class App:
         )
         self.full_log.pack(fill="both", expand=True, padx=2, pady=2)
 
-        self.gui_log = GuiLog(root, self.log)
+        # Status: fewer lines, smaller queue. Detail: larger buffer but still capped.
+        self.gui_log = GuiLog(root, self.log, max_lines=1500, max_queue=800, batch_per_tick=80)
         self.gui_log.pump()
-        self.gui_detail = GuiLog(root, self.full_log, max_lines=8000)
+        self.gui_detail = GuiLog(
+            root, self.full_log, max_lines=4000, max_queue=2000, batch_per_tick=250
+        )
         self.gui_detail.pump()
 
         hint = ttk.Label(
@@ -214,7 +221,7 @@ class App:
         elapsed = time.monotonic() - self._run_started_mono
         self.elapsed_lbl.configure(text=f"Время: {self._format_elapsed(elapsed)}")
         if self.running:
-            self._elapsed_job = self.root.after(250, self._tick_elapsed)
+            self._elapsed_job = self.root.after(500, self._tick_elapsed)
 
     def _start_elapsed(self) -> None:
         self._run_started_mono = time.monotonic()
@@ -224,7 +231,7 @@ class App:
                 self.root.after_cancel(self._elapsed_job)
             except Exception:
                 pass
-        self._elapsed_job = self.root.after(250, self._tick_elapsed)
+        self._elapsed_job = self.root.after(500, self._tick_elapsed)
 
     def _stop_elapsed(self, *, freeze: bool = True) -> None:
         if self._elapsed_job is not None:

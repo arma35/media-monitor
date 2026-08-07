@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "4.0.1"
+VERSION = "4.0.2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -105,13 +105,30 @@ def set_log_file(handle: TextIO | None) -> None:
     _LOG_FILE = handle
 
 
-def _write_log_file(line: str) -> None:
+_LOG_LINES_SINCE_FLUSH = 0
+_LOG_LAST_FLUSH_MONO = 0.0
+_LOG_FLUSH_EVERY_LINES = 40
+_LOG_FLUSH_EVERY_SEC = 0.75
+
+
+def _write_log_file(line: str, *, force_flush: bool = False) -> None:
+    """Append to the run log without flushing every single detail line."""
+    global _LOG_LINES_SINCE_FLUSH, _LOG_LAST_FLUSH_MONO
     fh = _LOG_FILE
     if fh is None:
         return
     try:
         fh.write(line)
-        fh.flush()
+        _LOG_LINES_SINCE_FLUSH += 1
+        now = time.monotonic()
+        if (
+            force_flush
+            or _LOG_LINES_SINCE_FLUSH >= _LOG_FLUSH_EVERY_LINES
+            or (now - _LOG_LAST_FLUSH_MONO) >= _LOG_FLUSH_EVERY_SEC
+        ):
+            fh.flush()
+            _LOG_LINES_SINCE_FLUSH = 0
+            _LOG_LAST_FLUSH_MONO = now
     except Exception:
         pass
 
@@ -169,24 +186,29 @@ def log_print(*args: object, **kwargs: object) -> None:
     with _PRINT_LOCK:
         try:
             print(*args, **kwargs)
+            # Status lines are rare — flush Tee so the log file stays current
+            # without flushing on every detail URL line.
+            if isinstance(sys.stdout, Tee):
+                sys.stdout.flush()
         except Exception:
             pass
         # When stdout is Tee'd to the log file, print already wrote there.
         # If not Tee'd (or Tee failed), still append once via handle.
         if _LOG_FILE is not None and not isinstance(sys.stdout, Tee):
-            _write_log_file(line)
+            _write_log_file(line, force_flush=True)
         cb = _LOG_CALLBACK
-        if cb is not None:
-            try:
-                cb(line)
-            except Exception:
-                pass
         detail_cb = _DETAIL_CALLBACK
-        if detail_cb is not None:
-            try:
-                detail_cb(line)
-            except Exception:
-                pass
+    # UI callbacks outside the print lock — otherwise Tk queue work stalls scans.
+    if cb is not None:
+        try:
+            cb(line)
+        except Exception:
+            pass
+    if detail_cb is not None:
+        try:
+            detail_cb(line)
+        except Exception:
+            pass
 
 
 def detail_print(*args: object, **kwargs: object) -> None:
@@ -209,11 +231,11 @@ def detail_print(*args: object, **kwargs: object) -> None:
             # Full detail always lands in the log file (not the Status tab).
             _write_log_file(line)
         detail_cb = _DETAIL_CALLBACK
-        if detail_cb is not None:
-            try:
-                detail_cb(line)
-            except Exception:
-                pass
+    if detail_cb is not None:
+        try:
+            detail_cb(line)
+        except Exception:
+            pass
 
 
 def app_dir() -> Path:
@@ -255,11 +277,12 @@ class Tee:
         self.streams = tuple(s for s in streams if s is not None)
 
     def write(self, data: str) -> int:
+        # Do not flush on every write — under parallel site workers that
+        # serializes the whole scan on disk I/O and freezes the GUI.
         with _PRINT_LOCK:
             for stream in self.streams:
                 try:
                     stream.write(data)
-                    stream.flush()
                 except Exception:
                     pass
         return len(data)
