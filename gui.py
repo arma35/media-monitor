@@ -25,23 +25,37 @@ class GuiLog:
         widget: scrolledtext.ScrolledText,
         *,
         max_lines: int = 0,
+        max_queue: int = 4000,
+        batch_per_tick: int = 40,
     ) -> None:
         self.root = root
         self.widget = widget
         self.q: queue.Queue[str] = queue.Queue()
         self.max_lines = max_lines
+        self.max_queue = max_queue
+        self.batch_per_tick = batch_per_tick
+        self._dropped = 0
 
     def write_line(self, line: str) -> None:
+        # Bound the queue so a flood of detail lines cannot freeze Tk forever.
+        while self.q.qsize() >= self.max_queue:
+            try:
+                self.q.get_nowait()
+                self._dropped += 1
+            except queue.Empty:
+                break
         self.q.put(line)
 
     def clear(self) -> None:
         self.widget.configure(state="normal")
         self.widget.delete("1.0", "end")
         self.widget.configure(state="disabled")
+        self._dropped = 0
 
     def pump(self) -> None:
+        n = 0
         try:
-            while True:
+            while n < self.batch_per_tick:
                 line = self.q.get_nowait()
                 self.widget.configure(state="normal")
                 self.widget.insert("end", line)
@@ -51,9 +65,22 @@ class GuiLog:
                         self.widget.delete("1.0", f"{last - self.max_lines}.0")
                 self.widget.see("end")
                 self.widget.configure(state="disabled")
+                n += 1
         except queue.Empty:
             pass
-        self.root.after(80, self.pump)
+        if self._dropped:
+            dropped = self._dropped
+            self._dropped = 0
+            self.widget.configure(state="normal")
+            self.widget.insert(
+                "end",
+                f"… пропущено строк лога (чтобы окно не зависало): {dropped}\n",
+            )
+            self.widget.see("end")
+            self.widget.configure(state="disabled")
+        # Drain faster while backlog remains; keep UI responsive.
+        delay = 30 if n >= self.batch_per_tick else 80
+        self.root.after(delay, self.pump)
 
 
 class App:
@@ -72,7 +99,9 @@ class App:
         self._elapsed_job: str | None = None
 
         self._build()
-        self._refresh_counts()
+        # Show the window first; load configs on the next Tk tick so startup
+        # does not look frozen while reading settings / creating examples.
+        self.root.after(0, self._refresh_counts)
         self._pump_progress()
 
     def _build(self) -> None:
@@ -316,7 +345,8 @@ class App:
     def on_start(self) -> None:
         if self.running:
             return
-        self._refresh_counts()
+        # Do not call _refresh_counts here — it can stall the UI briefly;
+        # counts were refreshed at idle and will refresh again when done.
         self.running = True
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")

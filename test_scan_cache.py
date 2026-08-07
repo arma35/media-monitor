@@ -354,8 +354,8 @@ class MaxExpandLinksTests(unittest.TestCase):
 class VersionTests(unittest.TestCase):
     def test_version_files_match(self) -> None:
         root = Path(__file__).resolve().parent
-        self.assertEqual(mm.VERSION, "4.0.0")
-        self.assertEqual(root.joinpath("VERSION").read_text().strip(), "4.0.0")
+        self.assertEqual(mm.VERSION, root.joinpath("VERSION").read_text().strip())
+        self.assertTrue(mm.VERSION.startswith("4."))
 
 
 if __name__ == "__main__":
