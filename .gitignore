@@ -17,6 +17,10 @@ setting.txt
 media-monitor_log.txt
 media-monitor.txt
 
+# Local SQLite scan cache (URLs already checked)
+scan_cache.sqlite
+scan_cache.sqlite-*
+
 # Generated reports
 reports/*
 !reports/.gitkeep
