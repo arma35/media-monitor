@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -553,11 +553,11 @@ class RunProgress:
         unavailable: bool = False,
         cancelled: bool = False,
     ) -> tuple[int, int]:
+        # `pages` counted live via note_pages / note_cache_skip — do not add again.
         with self._lock:
             self.active.discard(label)
             self.done += 1
             self.hits += hit_count
-            self.pages += pages
             if unavailable:
                 self.unavailable += 1
             if cancelled:
@@ -570,11 +570,18 @@ class RunProgress:
     def note_cache_skip(self, n: int = 1) -> None:
         with self._lock:
             self.cache_skipped += n
+            self.pages += n
         self._notify()
 
     def note_cache_add(self, n: int = 1) -> None:
         with self._lock:
             self.cache_added += n
+        self._notify()
+
+    def note_pages(self, n: int = 1) -> None:
+        """Live page-checked counter (HTTP scan completed)."""
+        with self._lock:
+            self.pages += n
         self._notify()
 
     def snapshot(self) -> dict:
@@ -2057,6 +2064,7 @@ def process_site(
                         phrases_hash=phrases_hash,
                     )
                     result.pages_scanned += 1
+                    progress.note_pages(1)
                     if cache_new:
                         progress.note_cache_add(cache_new)
                     if page_hits:
@@ -2189,10 +2197,11 @@ def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> None
 
 
 def _excel_safe_text(value: object) -> str:
-    """Strip characters illegal in OOXML shared strings (Excel repair dialog)."""
+    """Strip characters illegal in OOXML; trim whitespace."""
     text = "" if value is None else str(value)
     # XML 1.0 forbidden controls except tab/LF/CR
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return text.strip()
 
 
 def _style_as_hyperlink(cell) -> None:
@@ -2225,7 +2234,7 @@ def write_report(
         "версия ПО",
         "длительность генерации",
     )
-    ws.append(headers)
+    ws.append(list(headers))
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical="center")
@@ -2237,16 +2246,19 @@ def write_report(
     ws["G1"].font = Font(bold=True)
 
     # 1) Found pages first (normal rows).
+    # Use None (not "") for empty cells — empty inlineStr breaks Excel validation.
     for hit in hits:
+        url = _excel_safe_text(hit.url)
+        published = _excel_safe_text(hit.published_at) or None
         ws.append(
             (
-                _excel_safe_text(hit.phrase),
-                _excel_safe_text(hit.url),
-                _excel_safe_text(hit.published_at),
-                _excel_safe_text(hit.title),
+                _excel_safe_text(hit.phrase) or None,
+                url or None,
+                published,
+                _excel_safe_text(hit.title) or None,
                 hit.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
-                "",
-                "",
+                None,
+                None,
             )
         )
 
@@ -2254,8 +2266,12 @@ def write_report(
     if hit_last_row >= 2:
         for row in ws.iter_rows(min_row=2, max_col=2, max_row=hit_last_row):
             cell = row[1]
-            if cell.value and str(cell.value).startswith("http"):
-                cell.hyperlink = str(cell.value)
+            url = str(cell.value or "").strip()
+            if url.startswith("http"):
+                cell.value = url
+                # Formula hyperlinks are more reliable than relationship hyperlinks
+                # for Excel (avoids repair dialog on some builds).
+                cell.value = f'=HYPERLINK("{url.replace(chr(34), "")}","{url.replace(chr(34), "")}")'
                 _style_as_hyperlink(cell)
 
     # 2) Red block ONLY at the end: unavailable this run + commented in sites.txt.
@@ -2263,23 +2279,25 @@ def write_report(
     red_rows: dict[str, tuple[str, str]] = {}
     for site in unavailable_sites or []:
         key = site_host_key(site) or site
-        red_rows[key] = (site, "недоступен")
+        red_rows[key] = (_excel_safe_text(site), "недоступен")
     for site in commented_sites or []:
         key = site_host_key(site) or site
         if key not in red_rows:
-            red_rows[key] = (site, "закомментирован")
+            red_rows[key] = (_excel_safe_text(site), "закомментирован")
 
     for site, status in sorted(red_rows.values(), key=lambda x: site_host_key(x[0]) or x[0]):
-        ws.append((_excel_safe_text(site), _excel_safe_text(status), "", "", "", "", ""))
+        ws.append((site or None, status, None, None, None, None, None))
         row_idx = ws.max_row
         for col in (1, 2):
             cell = ws.cell(row=row_idx, column=col)
             cell.fill = red_fill
             cell.font = Font(bold=True, color="FFFFFF")
-        if str(site).startswith("http"):
+        if site.startswith("http"):
             link_cell = ws.cell(row=row_idx, column=1)
-            link_cell.hyperlink = str(site)
-            # Keep white bold on red; Excel still opens the link.
+            safe = site.replace('"', "")
+            link_cell.value = f'=HYPERLINK("{safe}","{safe}")'
+            link_cell.fill = red_fill
+            link_cell.font = Font(bold=True, color="FFFFFF", underline="single")
 
     widths = (36, 70, 20, 50, 22, 14, 22)
     for idx, width in enumerate(widths, start=1):

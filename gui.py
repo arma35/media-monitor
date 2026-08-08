@@ -336,6 +336,7 @@ class App:
         done = int(snap.get("done", 0))
         total = max(1, int(snap.get("total", 1)))
         hits = int(snap.get("hits", 0))
+        pages = int(snap.get("pages", 0))
         active = int(snap.get("active", 0))
         workers = int(snap.get("workers", self._cached_workers))
         unavailable = int(snap.get("unavailable", 0))
@@ -357,7 +358,7 @@ class App:
             self.status.configure(text="Остановка…")
             self.progress_lbl.configure(
                 text=(
-                    f"Остановка: готово {done}/{total} | находок {hits} | "
+                    f"Остановка: готово {done}/{total} | страниц {pages} | находок {hits} | "
                     f"ещё выходят: {active} | параллельно {workers}. "
                     "Сеть закрыта, Excel сохранится."
                 )
@@ -366,14 +367,14 @@ class App:
             self.status.configure(text=f"Пауза… {done}/{total}")
             self.progress_lbl.configure(
                 text=(
-                    f"Пауза: готово {done}/{total} | находок {hits} | "
-                    f"активных сайтов {active}. Нажмите «Продолжить»."
+                    f"Пауза: готово {done}/{total} | страниц проверено {pages} | "
+                    f"находок {hits} | активных сайтов {active}. Нажмите «Продолжить»."
                 )
             )
         else:
             self.status.configure(text=f"Сканирование… {done}/{total}")
             line = (
-                f"Готово {done}/{total} | находок {hits} | "
+                f"Готово {done}/{total} | страниц проверено {pages} | находок {hits} | "
                 f"сейчас качают {active} | параллельно {workers}"
             )
             if unavailable:
