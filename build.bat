@@ -22,13 +22,21 @@ if exist "VERSION" (
 echo.
 echo Building media-monitor v%APP_VERSION% ...
 set "EXE_NAME=media-monitor-v%APP_VERSION%"
-pyinstaller --noconfirm --clean --onefile --windowed --name "%EXE_NAME%" ^
+REM onedir: starts in seconds (onefile unpacks to %%TEMP%% every launch — minutes)
+pyinstaller --noconfirm --clean --onedir --windowed --name "%EXE_NAME%" ^
   --distpath dist ^
   --workpath build ^
+  --contents-directory _internal ^
   --add-data "certs;certs" ^
   --hidden-import gui ^
   main.py
 if errorlevel 1 exit /b 1
+
+REM Flatten onedir app folder into dist\ so configs sit next to the exe
+if exist "dist\%EXE_NAME%\" (
+  robocopy "dist\%EXE_NAME%" "dist" /E /MOVE >nul
+  if exist "dist\%EXE_NAME%\" rd /s /q "dist\%EXE_NAME%"
+)
 
 REM Drop unversioned copy if an older build left it behind.
 if exist "dist\media-monitor.exe" del /Q "dist\media-monitor.exe" >nul 2>nul
@@ -88,14 +96,16 @@ if exist "dist\setting.txt" (
 echo.
 echo ============================================
 echo  Build OK: media-monitor v%APP_VERSION%
-echo  Output: dist\%EXE_NAME%.exe
+echo  Output: dist\%EXE_NAME%.exe  (+ _internal\)
 echo ============================================
 echo   %EXE_NAME%.exe
+echo   _internal\   ^(библиотеки — не удалять^)
 echo   settings.example.txt  ^(образец, обновляется^)
 echo   settings.txt / sites.txt / words.txt / exclude.txt  ^(ваши, не затираются^)
-echo   ИНСТРУКЦИЯ.docx / ИНСТРУКЦИЯ.txt
+echo   ИНСТРУКЦИЯ.docx / ИНСТРУКЦИЯ.txt / INSTRUCTION.*
 echo   reports\
 echo Copy the whole dist\ folder anywhere ^(USB OK^).
+echo Do NOT launch from inside the zip — unpack first.
 echo.
 pause
 endlocal
