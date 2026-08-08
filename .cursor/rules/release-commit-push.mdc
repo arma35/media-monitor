@@ -1,14 +1,18 @@
 ---
-description: Every Media Monitor release must be committed and pushed to GitHub
+description: Every Media Monitor release must be committed, pushed, and copied into dist/
 alwaysApply: true
 ---
 
-# Release = commit + push
+# Release = commit + push + local dist
 
 When a version is bumped or a release build is produced:
 
 1. **Commit** all release-related source/docs/version changes (never secrets, `dist/`, reports, caches, or user `*.txt` configs).
 2. **Push** the branch to `origin` immediately after the commit.
 3. Prefer tagging/`gh release` only after the commit is on the remote.
+4. **Immediately update local `dist/`** with the new build (do not wait for the user to ask):
+   - Copy `media-monitor-vX.Y.Z.exe` (and `_internal/` if onedir) into `dist/`, replacing the previous exe.
+   - Prefer the CI/GitHub Release zip artifact unpacked into `dist/` over an outdated local PyInstaller folder.
+   - `dist/` stays gitignored — copy only locally; never commit it.
 
-Do not leave a new `VERSION` (e.g. 4.0.2) only in the working tree or only as a local `dist` exe.
+Do not leave a new `VERSION` (e.g. 4.0.2) only in the working tree or only on GitHub without also refreshing `dist/`.

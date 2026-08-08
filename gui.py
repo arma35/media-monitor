@@ -141,6 +141,8 @@ class App:
         self.dates_lbl.pack(anchor="w", pady=(2, 0))
         self.progress_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
         self.progress_lbl.pack(anchor="w", pady=(2, 0))
+        self.pages_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
+        self.pages_lbl.pack(anchor="w", pady=(2, 0))
         self.cache_lbl = ttk.Label(info, text="", font=("Segoe UI", 10))
         self.cache_lbl.pack(anchor="w", pady=(2, 0))
 
@@ -312,7 +314,7 @@ class App:
         )
         if not self.running:
             self.progress_lbl.configure(text="")
-            self.cache_lbl.configure(text="")
+            # Keep pages_lbl / cache_lbl from the last run until the next Start.
             self.progress_bar["value"] = 0
 
     def _on_progress(self, snap: dict) -> None:
@@ -354,11 +356,12 @@ class App:
         if active > len(names):
             names_txt += f"… (+{active - len(names)})"
 
+        scanned_now = max(0, pages - cache_skipped)
         if cancelling:
             self.status.configure(text="Остановка…")
             self.progress_lbl.configure(
                 text=(
-                    f"Остановка: готово {done}/{total} | страниц {pages} | находок {hits} | "
+                    f"Остановка: готово {done}/{total} | находок {hits} | "
                     f"ещё выходят: {active} | параллельно {workers}. "
                     "Сеть закрыта, Excel сохранится."
                 )
@@ -367,14 +370,14 @@ class App:
             self.status.configure(text=f"Пауза… {done}/{total}")
             self.progress_lbl.configure(
                 text=(
-                    f"Пауза: готово {done}/{total} | страниц проверено {pages} | "
-                    f"находок {hits} | активных сайтов {active}. Нажмите «Продолжить»."
+                    f"Пауза: готово {done}/{total} | находок {hits} | "
+                    f"активных сайтов {active}. Нажмите «Продолжить»."
                 )
             )
         else:
             self.status.configure(text=f"Сканирование… {done}/{total}")
             line = (
-                f"Готово {done}/{total} | страниц проверено {pages} | находок {hits} | "
+                f"Готово {done}/{total} | находок {hits} | "
                 f"сейчас качают {active} | параллельно {workers}"
             )
             if unavailable:
@@ -383,6 +386,12 @@ class App:
                 line += f" | {names_txt}"
             self.progress_lbl.configure(text=line)
 
+        self.pages_lbl.configure(
+            text=(
+                f"Страниц проверено в этом запуске: {pages} "
+                f"(скан {scanned_now} + кэш-пропуск {cache_skipped})"
+            )
+        )
         self.cache_lbl.configure(
             text=(
                 f"БД кэш: было {cache_before} | проверено ранее (пропуск) {cache_skipped} | "
@@ -405,6 +414,7 @@ class App:
         self.btn_stop.configure(state="normal")
         self.status.configure(text="Сканирование…")
         self.progress_lbl.configure(text="Запуск…")
+        self.pages_lbl.configure(text="Страниц проверено в этом запуске: 0")
         self.cache_lbl.configure(text="БД кэш: …")
         self.progress_bar["value"] = 0
         self._start_elapsed()
